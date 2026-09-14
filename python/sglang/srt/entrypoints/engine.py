@@ -432,6 +432,9 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        retire_authority: Optional[
+            Union[Dict[str, Any], List[Optional[Dict[str, Any]]]]
+        ] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -451,6 +454,7 @@ class Engine(EngineScoreMixin, EngineBase):
             mm_hashes=mm_hashes,
             mm_content_hashes=mm_content_hashes,
             cache_salt=cache_salt,
+            retire_authority=retire_authority,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -545,6 +549,9 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        retire_authority: Optional[
+            Union[Dict[str, Any], List[Optional[Dict[str, Any]]]]
+        ] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -564,6 +571,7 @@ class Engine(EngineScoreMixin, EngineBase):
             mm_hashes=mm_hashes,
             mm_content_hashes=mm_content_hashes,
             cache_salt=cache_salt,
+            retire_authority=retire_authority,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -1654,6 +1662,7 @@ class Engine(EngineScoreMixin, EngineBase):
         recv_req = sock_recv(self.send_to_rpc, flags=zmq.BLOCKY)
         assert isinstance(recv_req, RpcReqOutput)
         assert recv_req.success, recv_req.message
+        return recv_req.result
 
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)

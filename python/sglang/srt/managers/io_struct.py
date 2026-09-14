@@ -351,6 +351,12 @@ class GenerateReqInput:
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
 
+    # Internal RETIRE authority carried end-to-end with a generation request.
+    # Untagged requests retain the existing SGLang behavior.
+    retire_authority: Optional[
+        Union[Dict[str, Any], List[Optional[Dict[str, Any]]]]
+    ] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -546,6 +552,7 @@ class GenerateReqInput:
                 )
             if value == "":
                 setattr(self, field_name, None)
+        self._normalize_retire_authority(single=True, num=1)
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -570,6 +577,7 @@ class GenerateReqInput:
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
+        self._normalize_retire_authority(single=False, num=num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -831,6 +839,37 @@ class GenerateReqInput:
         else:
             raise ValueError("cache_salt should be a list or a string.")
 
+    def _normalize_retire_authority(self, *, single: bool, num: int) -> None:
+        """Validate the internal authority envelope before IPC serialization."""
+        from sglang.srt.retire.authority import RetireAuthorityTag
+
+        value = self.retire_authority
+        if value is None:
+            return
+        if single:
+            if isinstance(value, list):
+                raise ValueError(
+                    "retire_authority should be an object for a single request."
+                )
+            self.retire_authority = RetireAuthorityTag.from_value(value).to_dict()
+            return
+
+        if isinstance(value, dict):
+            normalized = RetireAuthorityTag.from_value(value).to_dict()
+            self.retire_authority = [normalized] * num
+            return
+        if not isinstance(value, list) or len(value) != self.batch_size:
+            raise ValueError(
+                "The length of retire_authority should be equal to the batch size."
+            )
+        normalized = [
+            None
+            if item is None
+            else RetireAuthorityTag.from_value(item).to_dict()
+            for item in value
+        ]
+        self.retire_authority = normalized * self.parallel_sample_num
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -962,6 +1001,11 @@ class GenerateReqInput:
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
+            retire_authority=(
+                self.retire_authority[i]
+                if isinstance(self.retire_authority, list)
+                else self.retire_authority
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -1077,6 +1121,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
+    # Validated RETIRE authority envelope. Schedulers validate it again at bind.
+    retire_authority: Optional[Dict[str, Any]] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1513,6 +1560,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
 
+    # Authority envelope aligned with each request ID.
+    retire_authorities: Optional[List[Optional[Dict[str, Any]]]] = None
+
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
     audio_tokens: Optional[List[int]] = None
@@ -1609,6 +1659,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # For observability
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+
+    # Detokenizer pass-through of BatchTokenIDOutput.retire_authorities.
+    retire_authorities: Optional[List[Optional[Dict[str, Any]]]] = None
 
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
@@ -2257,13 +2310,22 @@ class VertexGenerateReqInput(BaseReq, kw_only=True):
 
 class RpcReqInput(BaseReq, kw_only=True):
     method: str
-    # collective_rpc kwargs are flat scalars across all in-tree callers.
-    parameters: Optional[Dict[str, Union[bool, int, float, str, None]]] = None
+    parameters: Optional[Dict[str, Any]] = None
 
 
 class RpcReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    result: Any = None
+
+
+class RetireAuthorityAdvanceOutput(BaseReq, kw_only=True):
+    tenant_id: str
+    scope_id: str
+    retired_epoch: int
+    new_epoch: int
+    generation: int
+    nonce: str
 
 
 class LoadLoRAAdapterReqInput(BaseReq, kw_only=True):

@@ -13,6 +13,7 @@ from sglang.srt.runtime_context import (
     mamba_checkpoint_grid,
     mamba_track_grid,
 )
+from sglang.srt.retire.authority import RetireAuthorityTag
 from sglang.srt.utils.common import (
     Range,
     ceil_align,
@@ -976,9 +977,11 @@ class Req(ReqDllmMixin):
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        retire_authority: Optional[Dict[str, Any]] = None,
     ):
         # Input and output info
         self.rid = rid
+        self.retire_authority = RetireAuthorityTag.from_value(retire_authority)
         self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded

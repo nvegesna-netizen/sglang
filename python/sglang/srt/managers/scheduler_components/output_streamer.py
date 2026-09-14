@@ -59,6 +59,7 @@ class SchedulerOutputStreamer:
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
+    retire_is_current: Callable[[Any], bool] = lambda _: True
     # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
@@ -182,6 +183,14 @@ class SchedulerOutputStreamer:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
+
+            if not self.retire_is_current(req.retire_authority):
+                # A terminal abort must still reach the tokenizer so the
+                # request generator closes, but no not-yet-published token from
+                # the retired epoch may cross this gate.
+                if not req.finished():
+                    continue
+                req.send_token_offset = len(req.output_ids_through_stop)
 
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)
@@ -327,6 +336,7 @@ class _GenerationStreamAccumulator:
     output_reqs: list[Req] = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
     finished_reasons: list = field(default_factory=list)
+    retire_authorities: list = field(default_factory=list)
     decoded_texts: list = field(default_factory=list)
     decode_ids_list: list = field(default_factory=list)
     read_offsets: list = field(default_factory=list)
@@ -454,6 +464,11 @@ class _GenerationStreamAccumulator:
         self.output_reqs.append(req)
         self.finished_reasons.append(
             req.finished_reason.to_json() if req.finished_reason else None
+        )
+        self.retire_authorities.append(
+            req.retire_authority.to_dict()
+            if req.retire_authority is not None
+            else None
         )
         # Exclude the tokens after stop condition
         output_ids_ = req.output_ids_through_stop
@@ -704,6 +719,11 @@ class _GenerationStreamAccumulator:
             spec_cap_lens_histogram=self.spec_cap_lens_histogram,
             time_stats=wrap_as_pickle(self.time_stats),
             finished_reasons=self.finished_reasons,
+            retire_authorities=(
+                self.retire_authorities
+                if any(item is not None for item in self.retire_authorities)
+                else None
+            ),
             decoded_texts=self.decoded_texts,
             decode_ids=self.decode_ids_list,
             read_offsets=self.read_offsets,

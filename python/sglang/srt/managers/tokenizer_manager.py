@@ -79,6 +79,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    RetireAuthorityAdvanceOutput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
     SessionParams,
@@ -92,6 +93,11 @@ from sglang.srt.managers.io_struct import (
     build_flat_input_top_logprobs_arrays,
     sock_send,
     unwrap_from_pickle,
+)
+from sglang.srt.retire.authority import (
+    RetireAuthorityError,
+    RetireAuthorityTable,
+    RetireAuthorityTag,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
@@ -418,6 +424,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
+        self.retire_authority = RetireAuthorityTable()
         assert_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
         self.elastic_worker_count = get_parallel().dp_size
@@ -764,6 +771,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (HealthCheckOutput, lambda x: None),
                 # Same skip-detokenizer forwarding case as above.
                 (ConfigureLoggingReq, lambda x: None),
+                (
+                    RetireAuthorityAdvanceOutput,
+                    self._handle_retire_authority_advance,
+                ),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
             ]
@@ -772,6 +783,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
+
+    def _handle_retire_authority_advance(
+        self, output: RetireAuthorityAdvanceOutput
+    ) -> None:
+        self.retire_authority.advance(
+            tenant_id=output.tenant_id,
+            scope_id=output.scope_id,
+            retired_epoch=output.retired_epoch,
+            new_epoch=output.new_epoch,
+            generation=output.generation,
+        )
 
     async def generate_request(
         self,
@@ -1441,6 +1463,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 cache_salt=obj.cache_salt,
+                retire_authority=obj.retire_authority,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
@@ -2275,6 +2298,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 continue
 
+            if not self._retire_output_admissible(recv_obj, i, state):
+                continue
+
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
@@ -2559,6 +2585,63 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # handle_loop awaits next recv immediately
         for s in pending_notify.values():
             s.event.set()
+
+    def _retire_output_admissible(
+        self,
+        recv_obj: Union[BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput],
+        index: int,
+        state: ReqState,
+    ) -> bool:
+        """Apply the final Python publication gate for tagged generations."""
+        expected_raw = getattr(state.obj, "retire_authority", None)
+        authorities = getattr(recv_obj, "retire_authorities", None)
+        if authorities is not None and len(authorities) != len(recv_obj.rids):
+            logger.error(
+                "Dropping output with misaligned RETIRE authorities, rid=%s",
+                state.obj.rid,
+            )
+            return False
+        if expected_raw is None:
+            return authorities is None or authorities[index] is None
+        if authorities is None:
+            logger.error("Dropping RETIRE output with missing authority, rid=%s", state.obj.rid)
+            return False
+        try:
+            expected = RetireAuthorityTag.from_value(expected_raw)
+            observed = RetireAuthorityTag.from_value(authorities[index])
+        except RetireAuthorityError as error:
+            logger.error("Dropping malformed RETIRE output: %s", error)
+            return False
+        if observed != expected:
+            logger.error("Dropping RETIRE output with mismatched authority, rid=%s", state.obj.rid)
+            return False
+        if self.retire_authority.is_current(observed):
+            return True
+
+        reason = recv_obj.finished_reasons[index] or {}
+        if reason.get("type") != "abort":
+            logger.warning("Dropping stale nonterminal RETIRE output, rid=%s", state.obj.rid)
+            return False
+
+        # Preserve only the terminal abort needed to wake and close the caller.
+        if isinstance(recv_obj, BatchStrOutput):
+            recv_obj.output_strs[index] = ""
+        if not isinstance(recv_obj, BatchEmbeddingOutput) and recv_obj.output_ids is not None:
+            recv_obj.output_ids[index] = array("q")
+        for field_name in (
+            "output_token_logprobs_val",
+            "output_token_logprobs_idx",
+            "output_top_logprobs_val",
+            "output_top_logprobs_idx",
+            "output_token_ids_logprobs_val",
+            "output_token_ids_logprobs_idx",
+            "output_token_sampling_mask",
+            "output_token_sampling_logprobs",
+        ):
+            values = getattr(recv_obj, field_name, None)
+            if values is not None:
+                values[index] = []
+        return True
 
     @staticmethod
     def _accumulate_request_meta_info(
@@ -3510,6 +3593,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for rid, sub_obj, bootstrap_room in items:
             if rid in self.rid_to_state:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+            if isinstance(sub_obj, GenerateReqInput):
+                tag = RetireAuthorityTag.from_value(sub_obj.retire_authority)
+                if tag is not None:
+                    self.retire_authority.bind(rid, tag)
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state

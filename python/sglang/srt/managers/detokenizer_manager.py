@@ -38,10 +38,16 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     ConfigureLoggingReq,
     FreezeGCReq,
+    RetireAuthorityAdvanceOutput,
     sock_recv,
     sock_send,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
+from sglang.srt.retire.authority import (
+    RetireAuthorityError,
+    RetireAuthorityTable,
+    RetireAuthorityTag,
+)
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.runtime_context import (
     get_device,
@@ -107,6 +113,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        self.retire_authority = RetireAuthorityTable()
         # Init inter-process communication
         self.init_ipc_channels(port_args, server_args)
 
@@ -173,8 +180,21 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (FreezeGCReq, self.handle_freeze_gc_req),
                 (ConfigureLoggingReq, self.handle_configure_logging_req),
+                (RetireAuthorityAdvanceOutput, self.handle_retire_authority_advance),
             ]
         )
+
+    def handle_retire_authority_advance(
+        self, recv_obj: RetireAuthorityAdvanceOutput
+    ) -> RetireAuthorityAdvanceOutput:
+        self.retire_authority.advance(
+            tenant_id=recv_obj.tenant_id,
+            scope_id=recv_obj.scope_id,
+            retired_epoch=recv_obj.retired_epoch,
+            new_epoch=recv_obj.new_epoch,
+            generation=recv_obj.generation,
+        )
+        return recv_obj
 
     def event_loop(self):
         """The event loop that handles requests"""
@@ -441,6 +461,33 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         ]
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        stale_terminal_indices = set()
+        if recv_obj.retire_authorities is not None:
+            if len(recv_obj.retire_authorities) != len(recv_obj.rids):
+                raise RetireAuthorityError(
+                    "RETIRE output authority count does not match request count"
+                )
+            for i, (rid, raw_tag) in enumerate(
+                zip(recv_obj.rids, recv_obj.retire_authorities, strict=True)
+            ):
+                tag = RetireAuthorityTag.from_value(raw_tag)
+                try:
+                    if tag is not None:
+                        self.retire_authority.bind(rid, tag)
+                except RetireAuthorityError:
+                    pass
+                if self.retire_authority.is_current(tag):
+                    continue
+                reason = recv_obj.finished_reasons[i] or {}
+                if reason.get("type") != "abort":
+                    raise RetireAuthorityError(
+                        "stale RETIRE output was not a terminal abort"
+                    )
+                if recv_obj.output_ids is not None and recv_obj.output_ids[i]:
+                    raise RetireAuthorityError(
+                        "stale RETIRE terminal carried output token payload"
+                    )
+                stale_terminal_indices.add(i)
         # Beam decoding is additive: a batch may mix beam leaders with normal
         # requests, so every item still goes through the standard decode.
         if is_beam_search_batch(recv_obj):
@@ -456,12 +503,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
+        for i in stale_terminal_indices:
+            output_strs[i] = ""
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
             finished_reasons=recv_obj.finished_reasons,
+            retire_authorities=recv_obj.retire_authorities,
             output_strs=output_strs,
             output_ids=recv_obj.output_ids,
             prompt_tokens=recv_obj.prompt_tokens,

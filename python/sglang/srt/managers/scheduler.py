@@ -45,6 +45,10 @@ from sglang.srt.runtime_context import (
     get_spec,
     publish,
 )
+from sglang.srt.retire.authority import (
+    RetireAuthorityError,
+    RetireAuthorityTable,
+)
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -160,6 +164,7 @@ from sglang.srt.managers.io_struct import (
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
+    RetireAuthorityAdvanceOutput,
     RpcReqInput,
     RpcReqOutput,
     ScaleElasticEPReqInput,
@@ -458,6 +463,7 @@ class Scheduler(
         # Prefill tokens processed so far; used as the aging axis for the HRRN scheduling policy. Reqs snapshot this at waiting_queue entry.
         self.processed_tokens_counter: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
+        self.retire_authority = RetireAuthorityTable()
         self.init_soft_watchdog()
 
         # Parse args
@@ -2460,6 +2466,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
+            retire_is_current=self.retire_authority.is_current,
             rust_server=self.rust_server,
         )
 
@@ -2501,6 +2508,7 @@ class Scheduler(
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
+            retire_is_current=self.retire_authority.is_current,
         )
 
     def init_req_max_new_tokens(self, req):
@@ -2781,12 +2789,20 @@ class Scheduler(
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
                 cache_salt=recv_req.cache_salt,
+                retire_authority=recv_req.retire_authority,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+
+            if req.retire_authority is not None and is_beam:
+                error_msg = "RETIRE-tagged beam requests are not certified"
+                prepare_abort(req, error_msg, status_code=HTTPStatus.CONFLICT)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
 
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -2859,6 +2875,7 @@ class Scheduler(
                 recv_req.input_ids,
                 recv_req.sampling_params,
                 vocab_size=self.model_config.vocab_size,
+                retire_authority=recv_req.retire_authority,
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
@@ -3152,6 +3169,38 @@ class Scheduler(
             self._prefetch_kvcache(req)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        try:
+            if req.retire_authority is not None:
+                self.retire_authority.bind(req.rid, req.retire_authority)
+        except RetireAuthorityError as error:
+            message = f"RETIRE admission rejected: {error}"
+            logger.warning("%s, rid=%s", message, req.rid)
+            prepare_abort(req, message, status_code=HTTPStatus.CONFLICT)
+            self.output_streamer.stream_output([req], req.return_logprob)
+            return
+        if req.retire_authority is not None:
+            unsupported = []
+            if self.is_hybrid_swa or self.is_hybrid_ssm:
+                unsupported.append("hybrid KV")
+            if not self.spec_algorithm.is_none():
+                unsupported.append("speculative decoding")
+            if self.disaggregation_mode != DisaggregationMode.NULL:
+                unsupported.append("disaggregation")
+            if self.enable_hierarchical_cache:
+                unsupported.append("hierarchical cache")
+            if self.rust_server is not None:
+                unsupported.append("Rust frontend")
+            if req.session is not None or req.session_id is not None:
+                unsupported.append("sessions")
+            if unsupported:
+                message = (
+                    "RETIRE admission rejected for uncertified configuration: "
+                    + ", ".join(unsupported)
+                )
+                logger.warning("%s, rid=%s", message, req.rid)
+                prepare_abort(req, message, status_code=HTTPStatus.CONFLICT)
+                self.output_streamer.stream_output([req], req.return_logprob)
+                return
         if not self._set_or_validate_priority(req):
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
@@ -4215,6 +4264,11 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        for req in batch.reqs:
+            self.retire_authority.require_current(
+                req.retire_authority,
+                "model launch",
+            )
         self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
@@ -5131,19 +5185,122 @@ class Scheduler(
 
         success = True
         exec = None
+        result = None
         try:
             func = getattr(self, recv_req.method)
             if recv_req.parameters is not None:
-                func(**recv_req.parameters)
+                result = func(**recv_req.parameters)
             else:
-                func()
+                result = func()
         except Exception as e:
             success = False
             exec = e
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
 
         barrier(group=self.tp_group.cpu_group)
-        return RpcReqOutput(success=success, message="" if not exec else str(exec))
+        return RpcReqOutput(
+            success=success,
+            message="" if not exec else str(exec),
+            result=result,
+        )
+
+    def retire_advance(
+        self,
+        *,
+        tenant_id: str,
+        scope_id: str,
+        retired_epoch: int,
+        new_epoch: int,
+        generation: int,
+        nonce: str,
+    ) -> List[Dict[str, Any]]:
+        """Advance authority and return rank-level writer-drain evidence.
+
+        This executes on the scheduler thread.  Authority changes before the
+        device synchronization, so no later tagged batch can pass a launch or
+        commit gate while already-issued work is being drained.
+        """
+        if not nonce:
+            raise RetireAuthorityError("nonce must be a non-empty string")
+        advance_started_ns = time.monotonic_ns()
+        advance = self.retire_authority.advance(
+            tenant_id=tenant_id,
+            scope_id=scope_id,
+            retired_epoch=retired_epoch,
+            new_epoch=new_epoch,
+            generation=generation,
+        )
+        self.device_module.synchronize()
+        writer_drained_ns = time.monotonic_ns()
+
+        self.ipc_channels.send_to_detokenizer.send_output(
+            RetireAuthorityAdvanceOutput(
+                tenant_id=tenant_id,
+                scope_id=scope_id,
+                retired_epoch=retired_epoch,
+                new_epoch=new_epoch,
+                generation=generation,
+                nonce=nonce,
+            )
+        )
+
+        abort_reason = {
+            "type": "abort",
+            "message": (
+                f"RETIRE superseded tenant={tenant_id!r} scope={scope_id!r} "
+                f"epoch={retired_epoch}"
+            ),
+        }
+        for request_id in advance.retired_request_ids:
+            self.abort_request(
+                AbortReq(
+                    rid=request_id,
+                    finished_reason=abort_reason,
+                    abort_message=abort_reason["message"],
+                )
+            )
+
+        kv_pool_type = type(self.token_to_kv_pool_allocator).__name__
+        tree_cache_type = type(self.tree_cache).__name__
+        complete_single_group = (
+            not self.is_hybrid_swa
+            and not self.is_hybrid_ssm
+            and self.spec_algorithm.is_none()
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and not self.enable_hierarchical_cache
+            and self.rust_server is None
+            and kv_pool_type == "PagedTokenToKVPoolAllocator"
+            and tree_cache_type == "RadixCache"
+        )
+        local_receipt = {
+            "nonce": nonce,
+            "tenant_id": tenant_id,
+            "scope_id": scope_id,
+            "retired_epoch": retired_epoch,
+            "new_epoch": new_epoch,
+            "generation": generation,
+            "request_ids": list(advance.retired_request_ids),
+            "world_rank": self.world_group.rank,
+            "pipeline_parallel_rank": self.ps.pp_rank,
+            "tensor_parallel_rank": self.ps.tp_rank,
+            "safe_point_sequence": self.forward_ct,
+            "advance_started_ns": advance_started_ns,
+            "writer_drained_ns": writer_drained_ns,
+            "writer_drained": True,
+            "speculation_drained": self.spec_algorithm.is_none(),
+            "codec_drained": not self.enable_hierarchical_cache,
+            "transfer_drained": self.disaggregation_mode
+            == DisaggregationMode.NULL,
+            # The audited standard-transformer path has one target KV pool and
+            # one tree cache per scheduler rank. Hybrid, speculative,
+            # disaggregated, and hierarchical configurations remain
+            # uncertified until their additional state owners emit receipts.
+            "kv_group_ids": ["group-0"] if complete_single_group else [],
+            "participant_coordinate_complete": complete_single_group,
+            "kv_pool_type": kv_pool_type,
+            "tree_cache_type": tree_cache_type,
+        }
+        return self.world_group.all_gather_object(local_receipt)
 
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput

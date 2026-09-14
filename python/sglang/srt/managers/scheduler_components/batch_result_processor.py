@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
+    Any,
     TYPE_CHECKING,
     Callable,
     List,
@@ -112,6 +113,7 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
+    retire_is_current: Callable[[Any], bool] = lambda _: True
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -342,9 +344,19 @@ class SchedulerBatchResultProcessor:
                     continue
 
                 if req.inflight_middle_chunks <= 0:
+                    retire_revoked = not self.retire_is_current(
+                        req.retire_authority
+                    )
+                    if retire_revoked:
+                        req.to_finish = FINISH_ABORT(
+                            "RETIRE authority revoked before prefill result commit"
+                        )
+                        req.update_finish_state(0)
                     req.time_stats.set_prefill_finished_time()
 
-                    if sampling_mask_finish_reason is not None:
+                    if retire_revoked:
+                        pass
+                    elif sampling_mask_finish_reason is not None:
                         req.to_finish = sampling_mask_finish_reason
                         req.update_finish_state(0)
                     elif req.beam_group is not None:
@@ -376,7 +388,10 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(
                             req,
                             self.tree_cache,
-                            is_insert=sampling_mask_finish_reason is None,
+                            is_insert=(
+                                not retire_revoked
+                                and sampling_mask_finish_reason is None
+                            ),
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -994,6 +1009,12 @@ class SchedulerBatchResultProcessor:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
+            retire_revoked = not self.retire_is_current(req.retire_authority)
+            if retire_revoked:
+                req.to_finish = FINISH_ABORT(
+                    "RETIRE authority revoked before decode result commit"
+                )
+
             # next_token_id is a per-req list: 1 token for non-spec, the verified
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
             next_token_id = next_token_ids[i]
@@ -1007,7 +1028,9 @@ class SchedulerBatchResultProcessor:
                 sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(
                     status=status
                 )
-            if sampling_mask_finish_reason is not None:
+            if retire_revoked:
+                new_accept_len = 0
+            elif sampling_mask_finish_reason is not None:
                 req.to_finish = sampling_mask_finish_reason
                 new_accept_len = 0
             else:
@@ -1020,7 +1043,17 @@ class SchedulerBatchResultProcessor:
                 self._handle_sampling_mask_abort(req)
                 continue
 
-            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+            self._handle_finish_state_updated_req(
+                req,
+                batch,
+                result,
+                i,
+                logits_output,
+                force_no_insert=retire_revoked,
+            )
+
+            if retire_revoked:
+                continue
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
@@ -1260,6 +1293,8 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
         logits_output: LogitsProcessorOutput,
+        *,
+        force_no_insert: bool = False,
     ):
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
         known_mamba_boundary = None
@@ -1292,7 +1327,7 @@ class SchedulerBatchResultProcessor:
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
         should_update = completed_mamba_boundary if lazy else known_mamba_boundary
-        if should_update is None or should_update:
+        if not force_no_insert and (should_update is None or should_update):
             self._mamba_prefix_cache_update(
                 req,
                 batch,
@@ -1339,6 +1374,8 @@ class SchedulerBatchResultProcessor:
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
+                if force_no_insert:
+                    is_insert = False
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()

@@ -326,6 +326,7 @@ class Session:
             routing_key=req.routing_key,
             extra_key=req.extra_key,
             cache_salt=req.cache_salt,
+            retire_authority=req.retire_authority,
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
         )
