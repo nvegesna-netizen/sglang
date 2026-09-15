@@ -99,6 +99,7 @@ from sglang.srt.retire.authority import (
     RetireAuthorityTable,
     RetireAuthorityTag,
 )
+from sglang.srt.retire.test_interlock import RetireTestInterlock
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -425,6 +426,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Parse args
         self.server_args = server_args
         self.retire_authority = RetireAuthorityTable()
+        self.retire_test_interlock = RetireTestInterlock.from_environment("tokenizer")
         assert_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
         self.elastic_worker_count = get_parallel().dp_size
@@ -826,9 +828,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
-        self._init_req_state(obj, request)
         request_rids = {obj.rid} if obj.is_single else set(obj.rid)
+        self._init_req_state(obj, request)
         try:
+            await self._retire_test_pause(
+                "tokenizer_after_bind_before_scheduler_admission", obj
+            )
             if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
 
@@ -1835,6 +1840,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     continue
                 out = build_beam_search_out(out)
 
+            await self._retire_test_pause("tokenizer_before_client_publication", obj)
             self._retire_require_client_publication(obj, out)
 
             if finished:
@@ -1913,6 +1919,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             has_payload=has_payload,
             phase="tokenizer-manager client publication",
         )
+
+    async def _retire_test_pause(
+        self,
+        point: str,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+    ) -> None:
+        interlock = self.retire_test_interlock
+        if interlock is None:
+            return
+        objects = (
+            [obj]
+            if getattr(obj, "is_single", True)
+            else [obj[index] for index in range(len(obj.rid))]
+        )
+        for candidate in objects:
+            await interlock.pause_async(
+                point=point,
+                request_id=candidate.rid,
+                authority=RetireAuthorityTag.from_value(
+                    getattr(candidate, "retire_authority", None)
+                ),
+            )
 
     async def _handle_batch_request(
         self,
