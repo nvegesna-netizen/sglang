@@ -31,6 +31,7 @@ RetireKVInheritanceError = KV.RetireKVInheritanceError
 RetireKVInheritanceRegistry = KV.RetireKVInheritanceRegistry
 RetirePinnedPrefix = KV.RetirePinnedPrefix
 sequence_digest = KV.sequence_digest
+standard_cache_is_certifiable = KV.standard_cache_is_certifiable
 
 
 def prefix(*, request_id: str = "old", generation: int = 2):
@@ -49,6 +50,36 @@ def prefix(*, request_id: str = "old", generation: int = 2):
 
 
 class TestRetireKVInheritanceRegistry(unittest.TestCase):
+    def test_only_standard_single_group_cache_is_certifiable(self):
+        standard = {
+            "hybrid_swa": False,
+            "hybrid_ssm": False,
+            "speculative": False,
+            "diffusion": False,
+            "disaggregated": False,
+            "hierarchical_cache": False,
+            "rust_frontend": False,
+            "kv_pool_type": "PagedTokenToKVPoolAllocator",
+            "tree_cache_type": "RadixCache",
+        }
+        self.assertTrue(standard_cache_is_certifiable(**standard))
+        mutations = {
+            "hybrid_swa": True,
+            "hybrid_ssm": True,
+            "speculative": True,
+            "diffusion": True,
+            "disaggregated": True,
+            "hierarchical_cache": True,
+            "rust_frontend": True,
+            "kv_pool_type": "TokenToKVPoolAllocator",
+            "tree_cache_type": "ChunkCache",
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                self.assertFalse(
+                    standard_cache_is_certifiable(**{**standard, field: value})
+                )
+
     def test_sequence_digest_is_length_delimited_and_rejects_negative_values(self):
         self.assertNotEqual(sequence_digest((1, 23)), sequence_digest((12, 3)))
         with self.assertRaises(RetireKVInheritanceError):

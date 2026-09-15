@@ -53,6 +53,7 @@ from sglang.srt.retire.kv_inheritance import (
     RetireKVInheritanceError,
     RetireKVInheritanceRegistry,
     RetirePinnedPrefix,
+    standard_cache_is_certifiable,
 )
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
@@ -5598,9 +5599,28 @@ class Scheduler(
         self.device_module.synchronize()
         writer_drained_ns = time.monotonic_ns()
 
+        kv_pool_type = type(self.token_to_kv_pool_allocator).__name__
+        tree_cache_type = type(self.tree_cache).__name__
+        complete_single_group = standard_cache_is_certifiable(
+            hybrid_swa=self.is_hybrid_swa,
+            hybrid_ssm=self.is_hybrid_ssm,
+            speculative=not self.spec_algorithm.is_none(),
+            diffusion=self.dllm_config is not None,
+            disaggregated=self.disaggregation_mode != DisaggregationMode.NULL,
+            hierarchical_cache=self.enable_hierarchical_cache,
+            rust_frontend=self.rust_server is not None,
+            kv_pool_type=kv_pool_type,
+            tree_cache_type=tree_cache_type,
+        )
+
         pinned_sources: List[RetirePinnedPrefix] = []
         snapshot_errors: List[str] = []
-        for req in self._retire_live_requests(set(advance.retired_request_ids)):
+        live_requests = (
+            self._retire_live_requests(set(advance.retired_request_ids))
+            if complete_single_group
+            else []
+        )
+        for req in live_requests:
             try:
                 snapshot = self._retire_pin_committed_prefix(
                     req,
@@ -5650,19 +5670,6 @@ class Scheduler(
                 + "; ".join(snapshot_errors)
             )
 
-        kv_pool_type = type(self.token_to_kv_pool_allocator).__name__
-        tree_cache_type = type(self.tree_cache).__name__
-        complete_single_group = (
-            not self.is_hybrid_swa
-            and not self.is_hybrid_ssm
-            and self.spec_algorithm.is_none()
-            and self.dllm_config is None
-            and self.disaggregation_mode == DisaggregationMode.NULL
-            and not self.enable_hierarchical_cache
-            and self.rust_server is None
-            and kv_pool_type == "PagedTokenToKVPoolAllocator"
-            and tree_cache_type == "RadixCache"
-        )
         local_receipt = {
             "nonce": nonce,
             "tenant_id": tenant_id,

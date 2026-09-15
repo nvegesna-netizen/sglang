@@ -17,6 +17,35 @@ class RetireKVInheritanceError(RuntimeError):
     """Raised when physical KV inheritance cannot be certified."""
 
 
+def standard_cache_is_certifiable(
+    *,
+    hybrid_swa: bool,
+    hybrid_ssm: bool,
+    speculative: bool,
+    diffusion: bool,
+    disaggregated: bool,
+    hierarchical_cache: bool,
+    rust_frontend: bool,
+    kv_pool_type: str,
+    tree_cache_type: str,
+) -> bool:
+    """Return whether the scheduler has the one-group ownership topology."""
+
+    return not any(
+        (
+            hybrid_swa,
+            hybrid_ssm,
+            speculative,
+            diffusion,
+            disaggregated,
+            hierarchical_cache,
+            rust_frontend,
+            kv_pool_type != "PagedTokenToKVPoolAllocator",
+            tree_cache_type != "RadixCache",
+        )
+    )
+
+
 def _require_nonempty(value: str, field: str) -> None:
     if not isinstance(value, str) or not value:
         raise RetireKVInheritanceError(f"{field} must be a non-empty string")
