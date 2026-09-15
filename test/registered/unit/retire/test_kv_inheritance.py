@@ -194,7 +194,10 @@ class TestRetireKVInheritanceRegistry(unittest.TestCase):
             token_ids=(10, 11, 12, 13, 99),
             slot_ids=(30, 31, 32, 33),
         )
-        self.assertEqual(released, snapshot)
+        assert released is not None
+        released_snapshot, released_reservation = released
+        self.assertEqual(released_snapshot, snapshot)
+        self.assertEqual(released_reservation.successor_request_id, "new")
         self.assertEqual(
             registry.snapshot(),
             {"pinned_prefixes": 0, "pending_reservations": 0},

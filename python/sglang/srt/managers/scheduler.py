@@ -473,6 +473,7 @@ class Scheduler(
         self.retire_authority = RetireAuthorityTable()
         self.retire_kv_inheritance = RetireKVInheritanceRegistry()
         self._retire_pinned_nodes: Dict[tuple[str, str, int, str], Any] = {}
+        self._retire_launch_receipts: Dict[str, Dict[str, Any]] = {}
         self.init_soft_watchdog()
 
         # Parse args
@@ -5410,19 +5411,24 @@ class Scheduler(
         successor_token_ids: List[int],
         nonce: str,
     ) -> List[Dict[str, Any]]:
-        reservation = self.retire_kv_inheritance.reserve(
-            tenant_id=tenant_id,
-            scope_id=scope_id,
-            retired_epoch=retired_epoch,
-            source_request_id=source_request_id,
-            successor_request_id=successor_request_id,
-            new_epoch=new_epoch,
-            generation=generation,
-            reuse_tokens=reuse_tokens,
-            block_size=block_size,
-            cache_salt=cache_salt,
-            successor_token_ids=tuple(successor_token_ids),
-        )
+        reservation = None
+        error = None
+        try:
+            reservation = self.retire_kv_inheritance.reserve(
+                tenant_id=tenant_id,
+                scope_id=scope_id,
+                retired_epoch=retired_epoch,
+                source_request_id=source_request_id,
+                successor_request_id=successor_request_id,
+                new_epoch=new_epoch,
+                generation=generation,
+                reuse_tokens=reuse_tokens,
+                block_size=block_size,
+                cache_salt=cache_salt,
+                successor_token_ids=tuple(successor_token_ids),
+            )
+        except Exception as exc:
+            error = str(exc)
         local = {
             "nonce": nonce,
             "tenant_id": tenant_id,
@@ -5436,12 +5442,20 @@ class Scheduler(
             "pipeline_parallel_rank": self.ps.pp_rank,
             "tensor_parallel_rank": self.ps.tp_rank,
             "kv_group_id": "group-0",
-            "slot_digest": reservation.slot_digest,
-            "source_slot_digest": reservation.source_slot_digest,
-            "source_token_digest": reservation.source_token_digest,
-            "prepared": True,
+            "slot_digest": reservation.slot_digest if reservation is not None else None,
+            "source_slot_digest": (
+                reservation.source_slot_digest if reservation is not None else None
+            ),
+            "source_token_digest": (
+                reservation.source_token_digest if reservation is not None else None
+            ),
+            "prepared": reservation is not None,
+            "error": error,
         }
-        return self.world_group.all_gather_object(local)
+        receipts = self.world_group.all_gather_object(local)
+        if any(receipt.get("prepared") is not True for receipt in receipts):
+            self.retire_kv_inheritance.cancel_reservation(successor_request_id)
+        return receipts
 
     def retire_request_complete(self, *, request_id: str) -> List[Dict[str, Any]]:
         snapshot = self.retire_kv_inheritance.cancel_reservation(request_id)
@@ -5456,6 +5470,7 @@ class Scheduler(
             "pipeline_parallel_rank": self.ps.pp_rank,
             "tensor_parallel_rank": self.ps.tp_rank,
             "released_tokens": released,
+            "launch_receipt": self._retire_launch_receipts.pop(request_id, None),
         }
         return self.world_group.all_gather_object(local)
 
@@ -5488,7 +5503,7 @@ class Scheduler(
             return
         slot_ids = tuple(int(value) for value in req.prefix_indices.tolist())
         token_ids = tuple(req.full_untruncated_fill_ids)
-        snapshot = self.retire_kv_inheritance.verify_launch(
+        verified = self.retire_kv_inheritance.verify_launch(
             successor_request_id=req.rid,
             tenant_id=tag.tenant_id,
             scope_id=tag.scope_id,
@@ -5498,8 +5513,26 @@ class Scheduler(
             token_ids=token_ids,
             slot_ids=slot_ids,
         )
-        if snapshot is not None:
+        if verified is not None:
+            snapshot, reservation = verified
             self._retire_release_snapshots([snapshot])
+            self._retire_launch_receipts[req.rid] = {
+                "source_request_id": snapshot.source_request_id,
+                "successor_request_id": req.rid,
+                "tenant_id": tag.tenant_id,
+                "scope_id": tag.scope_id,
+                "retired_epoch": snapshot.retired_epoch,
+                "new_epoch": tag.epoch,
+                "generation": tag.generation,
+                "reuse_tokens": reservation.reuse_tokens,
+                "source_slot_digest": snapshot.slot_digest,
+                "adopted_slot_digest": reservation.slot_digest,
+                "pipeline_parallel_rank": self.ps.pp_rank,
+                "tensor_parallel_rank": self.ps.tp_rank,
+                "kv_group_id": "group-0",
+                "same_physical_slots": True,
+                "validated_before_forward_sequence": self.forward_ct + 1,
+            }
 
     def retire_advance(
         self,

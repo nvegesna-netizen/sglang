@@ -222,7 +222,7 @@ class RetireKVInheritanceRegistry:
         cache_salt: str,
         token_ids: tuple[int, ...],
         slot_ids: tuple[int, ...],
-    ) -> RetirePinnedPrefix | None:
+    ) -> tuple[RetirePinnedPrefix, RetireResumeReservation] | None:
         reservation = self._reservations.get(successor_request_id)
         if reservation is None:
             return None
@@ -255,7 +255,7 @@ class RetireKVInheritanceRegistry:
         snapshot = self._snapshots.pop(reservation.source_key)
         del self._reserved_sources[reservation.source_key]
         del self._reservations[successor_request_id]
-        return snapshot
+        return snapshot, reservation
 
     def cancel_reservation(
         self, successor_request_id: str
