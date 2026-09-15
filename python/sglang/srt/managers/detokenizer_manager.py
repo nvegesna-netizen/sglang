@@ -290,6 +290,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 sock_send(self.send_to_tokenizer, output)
+        else:
+            interlock.record_outcome(
+                "stale_detokenizer_output_dropped_before_tokenizer",
+                authority_is_current=self.retire_authority.is_current(tag),
+            )
         return True
 
     def trim_matched_stop(

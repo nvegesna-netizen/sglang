@@ -831,9 +831,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         request_rids = {obj.rid} if obj.is_single else set(obj.rid)
         self._init_req_state(obj, request)
         try:
-            await self._retire_test_pause(
+            paused_tag = await self._retire_test_pause(
                 "tokenizer_after_bind_before_scheduler_admission", obj
             )
+            if paused_tag is not None:
+                interlock = self.retire_test_interlock
+                assert interlock is not None
+                interlock.record_outcome(
+                    "stale_request_rejected_before_scheduler_admission",
+                    authority_is_current=self.retire_authority.is_current(paused_tag),
+                )
+                raise RetireAuthorityError(
+                    "stale RETIRE request rejected before scheduler admission"
+                )
             if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
 
@@ -1840,8 +1850,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     continue
                 out = build_beam_search_out(out)
 
-            await self._retire_test_pause("tokenizer_before_client_publication", obj)
-            self._retire_require_client_publication(obj, out)
+            paused_tag = await self._retire_test_pause(
+                "tokenizer_before_client_publication", obj
+            )
+            try:
+                self._retire_require_client_publication(obj, out)
+            except RetireAuthorityError:
+                if paused_tag is not None:
+                    interlock = self.retire_test_interlock
+                    assert interlock is not None
+                    interlock.record_outcome(
+                        "stale_frontend_output_rejected_before_client_yield",
+                        authority_is_current=self.retire_authority.is_current(
+                            paused_tag
+                        ),
+                    )
+                raise
 
             if finished:
                 # Record response sent time right before we log finished results and metrics.
@@ -1924,23 +1948,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         point: str,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
-    ) -> None:
+    ) -> RetireAuthorityTag | None:
         interlock = self.retire_test_interlock
         if interlock is None:
-            return
+            return None
         objects = (
             [obj]
             if getattr(obj, "is_single", True)
             else [obj[index] for index in range(len(obj.rid))]
         )
+        paused_tag = None
         for candidate in objects:
-            await interlock.pause_async(
+            tag = RetireAuthorityTag.from_value(
+                getattr(candidate, "retire_authority", None)
+            )
+            if not await interlock.pause_async(
                 point=point,
                 request_id=candidate.rid,
-                authority=RetireAuthorityTag.from_value(
-                    getattr(candidate, "retire_authority", None)
-                ),
-            )
+                authority=tag,
+            ):
+                continue
+            while self.retire_authority.is_current(tag):
+                interlock.require_within_timeout("local authority advance")
+                await asyncio.sleep(0.001)
+            paused_tag = tag
+        return paused_tag
 
     async def _handle_batch_request(
         self,

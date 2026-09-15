@@ -285,6 +285,11 @@ class SchedulerOutputStreamer:
         has_payload = bool(payload.output_ids and payload.output_ids[0])
         if reason.get("type") == "abort" and not has_payload:
             self._send_generation_payload(payload)
+        else:
+            interlock.record_outcome(
+                "stale_scheduler_output_dropped_before_transport",
+                authority_is_current=self.retire_is_current(tag),
+            )
         return True
 
     def build_additional_customized_info(self, reqs: List[Req]) -> dict[str, list]:

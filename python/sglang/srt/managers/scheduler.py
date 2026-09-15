@@ -787,11 +787,19 @@ class Scheduler(
         interlock = self.retire_test_interlock
         if interlock is None:
             return False
+        phase = (
+            "decode"
+            if batch.forward_mode.is_decode()
+            else "prefill"
+            if batch.forward_mode.is_extend()
+            else "other"
+        )
         for req in batch.reqs:
             if interlock.reach(
                 point="scheduler_before_result_commit",
                 request_id=req.rid,
                 authority=req.retire_authority,
+                phase=phase,
             ):
                 if self._retire_deferred_result is not None:
                     raise RetireTestInterlockError(
@@ -830,6 +838,10 @@ class Scheduler(
         ):
             return False
         self._retire_deferred_admission = None
+        interlock.record_outcome(
+            "stale_admission_dropped_before_model_launch",
+            authority_is_current=self.retire_authority.is_current(req.retire_authority),
+        )
         return True
 
     def _retire_poll_deferred_result(self) -> bool:
@@ -858,6 +870,12 @@ class Scheduler(
             return False
         self._retire_deferred_result = None
         self.process_batch_result(batch, result)
+        interlock.record_outcome(
+            "stale_result_reclaimed_without_token_or_cache_commit",
+            authority_is_current=self.retire_authority.is_current(
+                matched_req.retire_authority
+            ),
+        )
         return True
 
     def init_startup_timing_begin(self) -> None:

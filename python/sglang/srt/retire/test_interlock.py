@@ -35,6 +35,8 @@ _ARM_KEYS = {
     "point",
     "request_id",
     "authority",
+    "phase",
+    "occurrence",
     "timeout_s",
 }
 _RELEASE_KEYS = {
@@ -46,6 +48,24 @@ _RELEASE_KEYS = {
     "request_id",
     "advance_receipt_sha256",
     "injection_applied",
+}
+_OUTCOMES = {
+    "tokenizer_after_bind_before_scheduler_admission": (
+        "stale_request_rejected_before_scheduler_admission"
+    ),
+    "scheduler_after_admission_before_model_launch": (
+        "stale_admission_dropped_before_model_launch"
+    ),
+    "scheduler_before_result_commit": (
+        "stale_result_reclaimed_without_token_or_cache_commit"
+    ),
+    "scheduler_before_output": "stale_scheduler_output_dropped_before_transport",
+    "detokenizer_after_validation_before_publication": (
+        "stale_detokenizer_output_dropped_before_tokenizer"
+    ),
+    "tokenizer_before_client_publication": (
+        "stale_frontend_output_rejected_before_client_yield"
+    ),
 }
 
 
@@ -103,6 +123,8 @@ class RetireTestArm:
     point: str
     request_id: str
     authority: RetireAuthorityTag
+    phase: str
+    occurrence: int
     timeout_s: float
 
     @classmethod
@@ -120,6 +142,20 @@ class RetireTestArm:
             ) from error
         if authority is None:
             raise RetireTestInterlockError("test interlock authority is missing")
+        phase = _nonempty_string(payload["phase"], "phase")
+        if phase not in {"any", "prefill", "decode"}:
+            raise RetireTestInterlockError("unsupported test interlock phase")
+        if payload["point"] != "scheduler_before_result_commit" and phase != "any":
+            raise RetireTestInterlockError(
+                "only the scheduler result interlock accepts a selected phase"
+            )
+        occurrence = payload["occurrence"]
+        if (
+            not isinstance(occurrence, int)
+            or isinstance(occurrence, bool)
+            or occurrence <= 0
+        ):
+            raise RetireTestInterlockError("occurrence must be a positive integer")
         timeout_s = payload["timeout_s"]
         if (
             not isinstance(timeout_s, (int, float))
@@ -133,6 +169,8 @@ class RetireTestArm:
             point=_nonempty_string(payload["point"], "point"),
             request_id=_nonempty_string(payload["request_id"], "request_id"),
             authority=authority,
+            phase=phase,
+            occurrence=occurrence,
             timeout_s=float(timeout_s),
         )
 
@@ -147,6 +185,7 @@ class RetireTestInterlock:
         self._reached_authority: RetireAuthorityTag | None = None
         self._deadline: float | None = None
         self._completed = False
+        self._match_count = 0
 
     @classmethod
     def from_environment(cls, component: str) -> RetireTestInterlock | None:
@@ -178,6 +217,7 @@ class RetireTestInterlock:
         point: str,
         request_id: str,
         authority: RetireAuthorityTag | None,
+        phase: str = "any",
     ) -> bool:
         return (
             not self._completed
@@ -185,6 +225,7 @@ class RetireTestInterlock:
             and point == self.arm.point
             and request_id == self.arm.request_id
             and authority == self.arm.authority
+            and (self.arm.phase == "any" or phase == self.arm.phase)
         )
 
     def reach(
@@ -193,8 +234,14 @@ class RetireTestInterlock:
         point: str,
         request_id: str,
         authority: RetireAuthorityTag | None,
+        phase: str = "any",
     ) -> bool:
-        if not self.matches(point=point, request_id=request_id, authority=authority):
+        if not self.matches(
+            point=point,
+            request_id=request_id,
+            authority=authority,
+            phase=phase,
+        ):
             return False
         assert authority is not None
         if self._reached_authority is not None:
@@ -203,6 +250,9 @@ class RetireTestInterlock:
                     "test interlock reached with conflicting authority"
                 )
             return True
+        self._match_count += 1
+        if self._match_count != self.arm.occurrence:
+            return False
         reached = {
             "artifact": "retire_test_interlock_reached",
             "schema_version": 1,
@@ -211,6 +261,8 @@ class RetireTestInterlock:
             "point": point,
             "request_id": request_id,
             "authority": authority.to_dict(),
+            "phase": phase,
+            "occurrence": self.arm.occurrence,
             "process_id": os.getpid(),
             "reached_monotonic_ns": time.monotonic_ns(),
             "injection_applied": True,
@@ -291,6 +343,42 @@ class RetireTestInterlock:
                 f"timed out waiting for {self.component}:{phase}"
             )
 
+    def record_outcome(self, outcome: str, *, authority_is_current: bool) -> None:
+        """Bind a stage-specific stale action to the completed release chain."""
+
+        if not self._completed or self._reached_authority is None:
+            raise RetireTestInterlockError(
+                "cannot record a test interlock outcome before completion"
+            )
+        expected = _OUTCOMES.get(self.arm.point)
+        if outcome != expected:
+            raise RetireTestInterlockError(
+                f"unexpected outcome for {self.component}:{self.arm.point}"
+            )
+        if authority_is_current:
+            raise RetireTestInterlockError(
+                "cannot record stale test outcome while authority is current"
+            )
+        completed_raw = (self.root / "completed.json").read_bytes()
+        completed_sha256 = hashlib.sha256(completed_raw).hexdigest()
+        _atomic_json(
+            self.root / "outcome.json",
+            {
+                "artifact": "retire_test_interlock_outcome",
+                "schema_version": 1,
+                "nonce": self.arm.nonce,
+                "component": self.component,
+                "point": self.arm.point,
+                "request_id": self.arm.request_id,
+                "authority": self._reached_authority.to_dict(),
+                "outcome": outcome,
+                "local_authority_current": False,
+                "completed_sha256": completed_sha256,
+                "outcome_monotonic_ns": time.monotonic_ns(),
+                "injection_applied": True,
+            },
+        )
+
     def poll_release_after_authority_advance(
         self, *, authority_is_current: bool
     ) -> bool:
@@ -308,8 +396,14 @@ class RetireTestInterlock:
         point: str,
         request_id: str,
         authority: RetireAuthorityTag | None,
+        phase: str = "any",
     ) -> bool:
-        if not self.reach(point=point, request_id=request_id, authority=authority):
+        if not self.reach(
+            point=point,
+            request_id=request_id,
+            authority=authority,
+            phase=phase,
+        ):
             return False
         while not self.poll_release():
             await asyncio.sleep(0.001)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import hashlib
 import importlib.util
 import json
 import os
@@ -87,6 +88,8 @@ class TestRetireTestInterlock(unittest.IsolatedAsyncioTestCase):
         *,
         component: str = "tokenizer",
         point: str = "tokenizer_before_client_publication",
+        phase: str = "any",
+        occurrence: int = 1,
     ) -> None:
         payload = {
             "artifact": "retire_test_interlock_arm",
@@ -96,6 +99,8 @@ class TestRetireTestInterlock(unittest.IsolatedAsyncioTestCase):
             "point": point,
             "request_id": "request-1",
             "authority": authority().to_dict(),
+            "phase": phase,
+            "occurrence": occurrence,
             "timeout_s": 1,
         }
         (self.root / "arm.json").write_text(
@@ -170,6 +175,66 @@ class TestRetireTestInterlock(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(paused)
         self.assertFalse((self.root / "reached.json").exists())
 
+    def test_occurrence_selects_the_second_matching_boundary(self):
+        self.write_arm(
+            component="scheduler",
+            point="scheduler_before_result_commit",
+            occurrence=2,
+        )
+        with patch.dict(os.environ, self.environment(), clear=False):
+            interlock = RetireTestInterlock.from_environment("scheduler")
+            assert interlock is not None
+            self.assertFalse(
+                interlock.reach(
+                    point="scheduler_before_result_commit",
+                    request_id="request-1",
+                    authority=authority(),
+                )
+            )
+            self.assertFalse((self.root / "reached.json").exists())
+            self.assertTrue(
+                interlock.reach(
+                    point="scheduler_before_result_commit",
+                    request_id="request-1",
+                    authority=authority(),
+                )
+            )
+            reached = json.loads(
+                (self.root / "reached.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(reached["occurrence"], 2)
+
+    def test_result_phase_selects_decode_without_counting_prefill(self):
+        self.write_arm(
+            component="scheduler",
+            point="scheduler_before_result_commit",
+            phase="decode",
+        )
+        with patch.dict(os.environ, self.environment(), clear=False):
+            interlock = RetireTestInterlock.from_environment("scheduler")
+            assert interlock is not None
+            self.assertFalse(
+                interlock.reach(
+                    point="scheduler_before_result_commit",
+                    request_id="request-1",
+                    authority=authority(),
+                    phase="prefill",
+                )
+            )
+            self.assertFalse((self.root / "reached.json").exists())
+            self.assertTrue(
+                interlock.reach(
+                    point="scheduler_before_result_commit",
+                    request_id="request-1",
+                    authority=authority(),
+                    phase="decode",
+                )
+            )
+            reached = json.loads(
+                (self.root / "reached.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(reached["phase"], "decode")
+
     def test_synchronous_reach_and_poll_are_nonblocking_and_idempotent(self):
         self.write_arm(component="scheduler", point="scheduler_before_result_commit")
         with patch.dict(os.environ, self.environment(), clear=False):
@@ -238,6 +303,57 @@ class TestRetireTestInterlock(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             RetireTestInterlock.from_environment("tokenizer")
+
+    def test_outcome_binds_completed_receipt_and_requires_stale_authority(self):
+        self.write_arm(component="scheduler", point="scheduler_before_result_commit")
+        with patch.dict(os.environ, self.environment(), clear=False):
+            interlock = RetireTestInterlock.from_environment("scheduler")
+            assert interlock is not None
+            self.assertTrue(
+                interlock.reach(
+                    point="scheduler_before_result_commit",
+                    request_id="request-1",
+                    authority=authority(),
+                )
+            )
+            release = {
+                "artifact": "retire_test_interlock_release",
+                "schema_version": 1,
+                "nonce": "nonce-1",
+                "component": "scheduler",
+                "point": "scheduler_before_result_commit",
+                "request_id": "request-1",
+                "advance_receipt_sha256": "c" * 64,
+                "injection_applied": True,
+            }
+            (self.root / "release.json").write_text(
+                json.dumps(release, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(interlock.poll_release())
+            with self.assertRaisesRegex(
+                RetireTestInterlockError, "while authority is current"
+            ):
+                interlock.record_outcome(
+                    "stale_result_reclaimed_without_token_or_cache_commit",
+                    authority_is_current=True,
+                )
+            interlock.record_outcome(
+                "stale_result_reclaimed_without_token_or_cache_commit",
+                authority_is_current=False,
+            )
+
+        completed_sha256 = hashlib.sha256(
+            (self.root / "completed.json").read_bytes()
+        ).hexdigest()
+        outcome = json.loads((self.root / "outcome.json").read_text(encoding="utf-8"))
+        self.assertEqual(outcome["completed_sha256"], completed_sha256)
+        self.assertEqual(
+            outcome["outcome"],
+            "stale_result_reclaimed_without_token_or_cache_commit",
+        )
+        self.assertFalse(outcome["local_authority_current"])
+        self.assertTrue(outcome["injection_applied"])
 
     async def test_release_requires_exact_identity_and_advance_hash(self):
         self.write_arm()
@@ -362,6 +478,49 @@ class TestRetireTestInterlock(unittest.IsolatedAsyncioTestCase):
         self.assertLess(run_line, defer_line)
         self.assertLess(defer_line, result_line)
 
+        result_poll = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_retire_poll_deferred_result"
+        )
+        result_process_line = next(
+            item.lineno
+            for item in ast.walk(result_poll)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Attribute)
+            and item.func.attr == "process_batch_result"
+        )
+        result_outcome_line = next(
+            item.lineno
+            for item in ast.walk(result_poll)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Attribute)
+            and item.func.attr == "record_outcome"
+        )
+        self.assertLess(result_process_line, result_outcome_line)
+
+        result_defer = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_retire_defer_before_result_commit"
+        )
+        result_defer_calls = {
+            item.func.attr
+            for item in ast.walk(result_defer)
+            if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute)
+        }
+        result_defer_constants = {
+            item.value
+            for item in ast.walk(result_defer)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+        self.assertIn("is_extend", result_defer_calls)
+        self.assertIn("is_decode", result_defer_calls)
+        self.assertIn("prefill", result_defer_constants)
+        self.assertIn("decode", result_defer_constants)
+
         init_method = next(
             node
             for node in ast.walk(tree)
@@ -462,6 +621,7 @@ class TestRetireTestInterlock(unittest.IsolatedAsyncioTestCase):
         }
         self.assertIn("poll_release_after_authority_advance", poll_calls)
         self.assertIn("is_current", poll_calls)
+        self.assertIn("record_outcome", poll_calls)
 
     def test_scheduler_admission_interlock_follows_waiting_queue_append(self):
         scheduler_path = (
@@ -492,6 +652,20 @@ class TestRetireTestInterlock(unittest.IsolatedAsyncioTestCase):
             and item.func.attr == "_retire_defer_after_admission"
         )
         self.assertLess(append_line, interlock_line)
+
+        poll_admission = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_retire_poll_deferred_admission"
+        )
+        poll_calls = {
+            item.func.attr
+            for item in ast.walk(poll_admission)
+            if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute)
+        }
+        self.assertIn("poll_release_after_authority_advance", poll_calls)
+        self.assertIn("record_outcome", poll_calls)
 
     def test_scheduler_output_interlock_precedes_payload_send(self):
         output_path = (
@@ -539,8 +713,58 @@ class TestRetireTestInterlock(unittest.IsolatedAsyncioTestCase):
         }
         self.assertIn("poll_release_after_authority_advance", calls)
         self.assertIn("_send_generation_payload", calls)
+        self.assertIn("record_outcome", calls)
         self.assertIn("type", constants)
         self.assertIn("abort", constants)
+
+    def test_tokenizer_outcomes_precede_admission_and_client_yield(self):
+        tokenizer_path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/managers/tokenizer_manager.py"
+        )
+        tree = ast.parse(tokenizer_path.read_text(encoding="utf-8"))
+        generate = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "generate_request"
+        )
+        stream = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_stream_one_response"
+        )
+
+        admission_outcome = next(
+            item.lineno
+            for item in ast.walk(generate)
+            if isinstance(item, ast.Constant)
+            and item.value == "stale_request_rejected_before_scheduler_admission"
+        )
+        scheduler_send = next(
+            item.lineno
+            for item in ast.walk(generate)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Attribute)
+            and item.func.attr == "_send_one_request"
+        )
+        publication_outcome = next(
+            item.lineno
+            for item in ast.walk(stream)
+            if isinstance(item, ast.Constant)
+            and item.value == "stale_frontend_output_rejected_before_client_yield"
+        )
+        output_yields = [
+            item.lineno
+            for item in ast.walk(stream)
+            if isinstance(item, ast.Yield)
+            and isinstance(item.value, ast.Name)
+            and item.value.id in {"out", "abort_out"}
+        ]
+        self.assertLess(admission_outcome, scheduler_send)
+        self.assertTrue(output_yields)
+        self.assertLess(publication_outcome, min(output_yields))
 
 
 if __name__ == "__main__":
