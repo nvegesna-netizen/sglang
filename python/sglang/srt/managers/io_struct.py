@@ -863,9 +863,7 @@ class GenerateReqInput:
                 "The length of retire_authority should be equal to the batch size."
             )
         normalized = [
-            None
-            if item is None
-            else RetireAuthorityTag.from_value(item).to_dict()
+            None if item is None else RetireAuthorityTag.from_value(item).to_dict()
             for item in value
         ]
         self.retire_authority = normalized * self.parallel_sample_num
@@ -2105,6 +2103,8 @@ class SlowDownReqOutput(BaseReq, kw_only=True):
 class AbortReq(BaseReq, kw_only=True):
     # Whether to abort all requests
     abort_all: bool = False
+    # Match one complete request ID instead of the public prefix-abort behavior.
+    exact_match: bool = False
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
@@ -2114,6 +2114,13 @@ class AbortReq(BaseReq, kw_only=True):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
             self.rid = ""
+
+    def matches(self, request_id: str) -> bool:
+        return self.abort_all or (
+            request_id == self.rid
+            if self.exact_match
+            else request_id.startswith(self.rid)
+        )
 
 
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):

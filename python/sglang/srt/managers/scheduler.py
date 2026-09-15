@@ -49,6 +49,11 @@ from sglang.srt.retire.authority import (
     RetireAuthorityError,
     RetireAuthorityTable,
 )
+from sglang.srt.retire.kv_inheritance import (
+    RetireKVInheritanceError,
+    RetireKVInheritanceRegistry,
+    RetirePinnedPrefix,
+)
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -289,6 +294,8 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_discard,
 )
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -464,6 +471,8 @@ class Scheduler(
         self.processed_tokens_counter: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         self.retire_authority = RetireAuthorityTable()
+        self.retire_kv_inheritance = RetireKVInheritanceRegistry()
+        self._retire_pinned_nodes: Dict[tuple[str, str, int, str], Any] = {}
         self.init_soft_watchdog()
 
         # Parse args
@@ -3180,10 +3189,22 @@ class Scheduler(
             return
         if req.retire_authority is not None:
             unsupported = []
+            if (
+                type(self.token_to_kv_pool_allocator).__name__
+                != "PagedTokenToKVPoolAllocator"
+            ):
+                unsupported.append("non-paged KV allocator")
+            if (
+                type(self.tree_cache).__name__ != "RadixCache"
+                or self.tree_cache.disable
+            ):
+                unsupported.append("non-RadixCache prefix ownership")
             if self.is_hybrid_swa or self.is_hybrid_ssm:
                 unsupported.append("hybrid KV")
             if not self.spec_algorithm.is_none():
                 unsupported.append("speculative decoding")
+            if self.dllm_config is not None:
+                unsupported.append("diffusion decoding")
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 unsupported.append("disaggregation")
             if self.enable_hierarchical_cache:
@@ -3192,6 +3213,10 @@ class Scheduler(
                 unsupported.append("Rust frontend")
             if req.session is not None or req.session_id is not None:
                 unsupported.append("sessions")
+            if req.extra_key is not None:
+                unsupported.append("extra cache namespaces or LoRA")
+            if req.input_embeds is not None or req.multimodal_inputs is not None:
+                unsupported.append("embedding or multimodal inputs")
             if unsupported:
                 message = (
                     "RETIRE admission rejected for uncertified configuration: "
@@ -4269,6 +4294,7 @@ class Scheduler(
                 req.retire_authority,
                 "model launch",
             )
+            self._retire_validate_resume_launch(req)
         self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
@@ -5204,6 +5230,277 @@ class Scheduler(
             result=result,
         )
 
+    def _retire_live_requests(self, request_ids: Set[str]) -> List[Req]:
+        candidates = set(self.collect_inflight_reqs())
+        candidates.update(self.waiting_queue)
+        if self.chunked_req is not None:
+            candidates.add(self.chunked_req)
+        return sorted(
+            (req for req in candidates if req.rid in request_ids),
+            key=lambda req: req.rid,
+        )
+
+    def _retire_pin_committed_prefix(
+        self,
+        req: Req,
+        *,
+        retired_epoch: int,
+        generation: int,
+    ) -> Optional[RetirePinnedPrefix]:
+        """Transfer a drained, page-aligned request prefix to RadixCache."""
+
+        tag = req.retire_authority
+        if (
+            tag is None
+            or tag.epoch != retired_epoch
+            or tag.generation != generation
+            or not req.kv.holds_kv
+        ):
+            return None
+        if req.extra_key is not None or req.cache_salt is None:
+            return None
+
+        committed = min(req.effective_kv_committed_len(), req.kv.kv_allocated_len)
+        aligned = committed - (committed % self.page_size)
+        if aligned <= 0:
+            return None
+        if req.kv.cache_protected_len > aligned:
+            raise RetireKVInheritanceError(
+                "request cache-protected prefix exceeds drained frontier"
+            )
+
+        token_ids = tuple((req.origin_input_ids + req.output_ids)[:aligned])
+        if len(token_ids) != aligned:
+            raise RetireKVInheritanceError(
+                "request token row is shorter than drained KV frontier"
+            )
+        request_row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+        original_indices = request_row[:aligned].to(dtype=torch.int64, copy=True)
+        radix_key = RadixKey(
+            array("q", token_ids),
+            req.extra_key,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        if len(radix_key) != aligned:
+            raise RetireKVInheritanceError("RadixCache changed the aligned frontier")
+
+        insert_result = self.tree_cache.insert(
+            InsertParams(
+                key=radix_key,
+                value=original_indices,
+                priority=getattr(req, "priority", 0) or 0,
+            )
+        )
+        if insert_result.prefix_len < req.kv.cache_protected_len:
+            raise RetireKVInheritanceError(
+                "RadixCache insertion regressed the protected prefix"
+            )
+        match = self.tree_cache.match_prefix(MatchPrefixParams(key=radix_key))
+        canonical_indices = match.device_indices
+        if len(canonical_indices) != aligned:
+            raise RetireKVInheritanceError(
+                "RadixCache did not return the complete inserted prefix"
+            )
+
+        # First lock is the request's replacement prefix lock; the second is
+        # the independent RETIRE pin that survives stale-request cleanup.
+        request_lock = self.tree_cache.inc_lock_ref(match.last_device_node)
+        self.tree_cache.inc_lock_ref(match.last_device_node)
+        if req.last_node is not None:
+            self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt)
+
+        protected = req.kv.cache_protected_len
+        self.token_to_kv_pool_allocator.free_segment(
+            original_indices[protected : insert_result.prefix_len],
+            start_pos=protected,
+        )
+        self.req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(protected, aligned)),
+            canonical_indices[protected:],
+        )
+        req.kv.cache_protected_len = aligned
+        req.prefix_indices = canonical_indices
+        req.last_node = match.last_device_node
+        req.lock_receipt = request_lock.to_dec_params()
+
+        snapshot = RetirePinnedPrefix(
+            tenant_id=tag.tenant_id,
+            scope_id=tag.scope_id,
+            retired_epoch=retired_epoch,
+            generation=generation,
+            source_request_id=req.rid,
+            cache_salt=req.cache_salt,
+            block_size=self.page_size,
+            token_ids=token_ids,
+            slot_ids=tuple(int(value) for value in canonical_indices.tolist()),
+            writer_drained_sequence=self.forward_ct,
+        )
+        self.retire_kv_inheritance.install(snapshot)
+        self._retire_pinned_nodes[snapshot.key] = match.last_device_node
+        return snapshot
+
+    def _retire_release_snapshots(
+        self, snapshots: List[RetirePinnedPrefix] | tuple[RetirePinnedPrefix, ...]
+    ) -> int:
+        released = 0
+        for snapshot in snapshots:
+            node = self._retire_pinned_nodes.pop(snapshot.key, None)
+            if node is None:
+                raise RetireKVInheritanceError(
+                    "pinned-prefix registry has no RadixCache lock"
+                )
+            self.tree_cache.dec_lock_ref(node)
+            released += snapshot.pinned_tokens
+        return released
+
+    def retire_probe_reuse(
+        self,
+        *,
+        tenant_id: str,
+        scope_id: str,
+        retired_epoch: int,
+        source_request_id: str,
+        block_aligned_tokens: int,
+        block_size: int,
+        nonce: str,
+    ) -> List[Dict[str, Any]]:
+        result = self.retire_kv_inheritance.probe(
+            tenant_id=tenant_id,
+            scope_id=scope_id,
+            retired_epoch=retired_epoch,
+            source_request_id=source_request_id,
+            requested_tokens=block_aligned_tokens,
+            block_size=block_size,
+        )
+        snapshot, available = result if result is not None else (None, 0)
+        local = {
+            "nonce": nonce,
+            "tenant_id": tenant_id,
+            "scope_id": scope_id,
+            "retired_epoch": retired_epoch,
+            "source_request_id": source_request_id,
+            "pipeline_parallel_rank": self.ps.pp_rank,
+            "tensor_parallel_rank": self.ps.tp_rank,
+            "kv_group_id": "group-0",
+            "tier": "hbm" if snapshot is not None and available > 0 else "cold",
+            "available_tokens": available,
+            "committed_tokens": available,
+            "writer_drained": snapshot is not None,
+            "slot_digest": snapshot.slot_digest if snapshot is not None else None,
+            "token_digest": snapshot.token_digest if snapshot is not None else None,
+            "writer_drained_sequence": (
+                snapshot.writer_drained_sequence if snapshot is not None else None
+            ),
+        }
+        return self.world_group.all_gather_object(local)
+
+    def retire_prepare_resume(
+        self,
+        *,
+        tenant_id: str,
+        scope_id: str,
+        retired_epoch: int,
+        source_request_id: str,
+        successor_request_id: str,
+        new_epoch: int,
+        generation: int,
+        reuse_tokens: int,
+        block_size: int,
+        cache_salt: str,
+        successor_token_ids: List[int],
+        nonce: str,
+    ) -> List[Dict[str, Any]]:
+        reservation = self.retire_kv_inheritance.reserve(
+            tenant_id=tenant_id,
+            scope_id=scope_id,
+            retired_epoch=retired_epoch,
+            source_request_id=source_request_id,
+            successor_request_id=successor_request_id,
+            new_epoch=new_epoch,
+            generation=generation,
+            reuse_tokens=reuse_tokens,
+            block_size=block_size,
+            cache_salt=cache_salt,
+            successor_token_ids=tuple(successor_token_ids),
+        )
+        local = {
+            "nonce": nonce,
+            "tenant_id": tenant_id,
+            "scope_id": scope_id,
+            "retired_epoch": retired_epoch,
+            "source_request_id": source_request_id,
+            "successor_request_id": successor_request_id,
+            "new_epoch": new_epoch,
+            "generation": generation,
+            "reuse_tokens": reuse_tokens,
+            "pipeline_parallel_rank": self.ps.pp_rank,
+            "tensor_parallel_rank": self.ps.tp_rank,
+            "kv_group_id": "group-0",
+            "slot_digest": reservation.slot_digest,
+            "source_slot_digest": reservation.source_slot_digest,
+            "source_token_digest": reservation.source_token_digest,
+            "prepared": True,
+        }
+        return self.world_group.all_gather_object(local)
+
+    def retire_request_complete(self, *, request_id: str) -> List[Dict[str, Any]]:
+        snapshot = self.retire_kv_inheritance.cancel_reservation(request_id)
+        released = 0
+        if snapshot is not None:
+            candidates = self.retire_kv_inheritance.pop_unreserved_scope(
+                snapshot.tenant_id, snapshot.scope_id, snapshot.retired_epoch
+            )
+            released = self._retire_release_snapshots(candidates)
+        local = {
+            "request_id": request_id,
+            "pipeline_parallel_rank": self.ps.pp_rank,
+            "tensor_parallel_rank": self.ps.tp_rank,
+            "released_tokens": released,
+        }
+        return self.world_group.all_gather_object(local)
+
+    def retire_release_scope(
+        self, *, tenant_id: str, scope_id: str, retired_epoch: int, nonce: str
+    ) -> List[Dict[str, Any]]:
+        candidates = self.retire_kv_inheritance.pop_unreserved_scope(
+            tenant_id, scope_id, retired_epoch
+        )
+        released = self._retire_release_snapshots(candidates)
+        state = self.retire_kv_inheritance.scope_state(
+            tenant_id, scope_id, retired_epoch
+        )
+        local = {
+            "nonce": nonce,
+            "tenant_id": tenant_id,
+            "scope_id": scope_id,
+            "retired_epoch": retired_epoch,
+            "pipeline_parallel_rank": self.ps.pp_rank,
+            "tensor_parallel_rank": self.ps.tp_rank,
+            "kv_group_id": "group-0",
+            "released_tokens": released,
+            **state,
+        }
+        return self.world_group.all_gather_object(local)
+
+    def _retire_validate_resume_launch(self, req: Req) -> None:
+        tag = req.retire_authority
+        if tag is None:
+            return
+        slot_ids = tuple(int(value) for value in req.prefix_indices.tolist())
+        token_ids = tuple(req.full_untruncated_fill_ids)
+        snapshot = self.retire_kv_inheritance.verify_launch(
+            successor_request_id=req.rid,
+            tenant_id=tag.tenant_id,
+            scope_id=tag.scope_id,
+            epoch=tag.epoch,
+            generation=tag.generation,
+            cache_salt=req.cache_salt or "",
+            token_ids=token_ids,
+            slot_ids=slot_ids,
+        )
+        if snapshot is not None:
+            self._retire_release_snapshots([snapshot])
+
     def retire_advance(
         self,
         *,
@@ -5233,6 +5530,24 @@ class Scheduler(
         self.device_module.synchronize()
         writer_drained_ns = time.monotonic_ns()
 
+        pinned_sources: List[RetirePinnedPrefix] = []
+        snapshot_errors: List[str] = []
+        for req in self._retire_live_requests(set(advance.retired_request_ids)):
+            try:
+                snapshot = self._retire_pin_committed_prefix(
+                    req,
+                    retired_epoch=retired_epoch,
+                    generation=(
+                        req.retire_authority.generation
+                        if req.retire_authority is not None
+                        else generation
+                    ),
+                )
+                if snapshot is not None:
+                    pinned_sources.append(snapshot)
+            except Exception as error:
+                snapshot_errors.append(f"{req.rid}: {error}")
+
         self.ipc_channels.send_to_detokenizer.send_output(
             RetireAuthorityAdvanceOutput(
                 tenant_id=tenant_id,
@@ -5255,9 +5570,16 @@ class Scheduler(
             self.abort_request(
                 AbortReq(
                     rid=request_id,
+                    exact_match=True,
                     finished_reason=abort_reason,
                     abort_message=abort_reason["message"],
                 )
+            )
+
+        if snapshot_errors:
+            raise RetireKVInheritanceError(
+                "failed to snapshot drained RETIRE prefixes: "
+                + "; ".join(snapshot_errors)
             )
 
         kv_pool_type = type(self.token_to_kv_pool_allocator).__name__
@@ -5266,6 +5588,7 @@ class Scheduler(
             not self.is_hybrid_swa
             and not self.is_hybrid_ssm
             and self.spec_algorithm.is_none()
+            and self.dllm_config is None
             and self.disaggregation_mode == DisaggregationMode.NULL
             and not self.enable_hierarchical_cache
             and self.rust_server is None
@@ -5289,8 +5612,7 @@ class Scheduler(
             "writer_drained": True,
             "speculation_drained": self.spec_algorithm.is_none(),
             "codec_drained": not self.enable_hierarchical_cache,
-            "transfer_drained": self.disaggregation_mode
-            == DisaggregationMode.NULL,
+            "transfer_drained": self.disaggregation_mode == DisaggregationMode.NULL,
             # The audited standard-transformer path has one target KV pool and
             # one tree cache per scheduler rank. Hybrid, speculative,
             # disaggregated, and hierarchical configurations remain
@@ -5299,6 +5621,17 @@ class Scheduler(
             "participant_coordinate_complete": complete_single_group,
             "kv_pool_type": kv_pool_type,
             "tree_cache_type": tree_cache_type,
+            "sources": [
+                {
+                    "source_request_id": source.source_request_id,
+                    "pinned_tokens": source.pinned_tokens,
+                    "committed_tokens": source.pinned_tokens,
+                    "slot_digest": source.slot_digest,
+                    "token_digest": source.token_digest,
+                    "writer_drained_sequence": source.writer_drained_sequence,
+                }
+                for source in pinned_sources
+            ],
         }
         return self.world_group.all_gather_object(local_receipt)
 
@@ -5340,7 +5673,7 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
-            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+            if recv_req.matches(chunked_req.rid):
                 self._pending_chunked_abort_req = chunked_req
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
@@ -5351,7 +5684,7 @@ class Scheduler(
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+            if recv_req.matches(req.rid):
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting
@@ -5414,7 +5747,7 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # Abort requests that have not yet been bootstrapped
             for req in self.disagg_prefill_bootstrap_queue.queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                if recv_req.matches(req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     self._release_aborted_request(req.rid)
 
@@ -5425,7 +5758,7 @@ class Scheduler(
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                if recv_req.matches(req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
@@ -5433,7 +5766,7 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                if recv_req.matches(decode_req.req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
                     if self.ps.pp_size > 1:
@@ -5441,7 +5774,7 @@ class Scheduler(
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                if recv_req.matches(decode_req.req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     receiver = decode_req.kv_receiver
                     receiver.abort()
@@ -5463,7 +5796,7 @@ class Scheduler(
             if self.disagg_decode_prealloc_queue.retracted_queue:
                 remaining_retracted = []
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
+                    if recv_req.matches(decode_req.rid):
                         retraction_discard(
                             decode_req,
                             self.tree_cache,
@@ -5478,9 +5811,7 @@ class Scheduler(
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
-            ):
+            if not req.finished() and recv_req.matches(req.rid):
                 # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.

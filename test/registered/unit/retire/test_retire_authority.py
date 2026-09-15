@@ -6,10 +6,19 @@ import threading
 import unittest
 from pathlib import Path
 
+try:
+    from sglang.test.ci.ci_register import register_cpu_ci
+except ModuleNotFoundError:
+    # Keep this dependency-free test runnable before the SGLang image exists.
+    def register_cpu_ci(**_kwargs):
+        return None
+
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
 
 MODULE_PATH = (
-    Path(__file__).resolve().parents[4]
-    / "python/sglang/srt/retire/authority.py"
+    Path(__file__).resolve().parents[4] / "python/sglang/srt/retire/authority.py"
 )
 SPEC = importlib.util.spec_from_file_location("sglang_retire_authority", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
