@@ -5510,6 +5510,33 @@ class Scheduler(
         }
         return self.world_group.all_gather_object(local)
 
+    def retire_test_corrupt_resume_slot(
+        self,
+        *,
+        successor_request_id: str,
+        slot_offset: int,
+        nonce: str,
+    ) -> List[Dict[str, Any]]:
+        if os.environ.get("SGLANG_RETIRE_TEST_FAULTS") != "1":
+            raise RetireKVInheritanceError(
+                "RETIRE test fault injection is not explicitly enabled"
+            )
+        before, after = self.retire_kv_inheritance.test_corrupt_reservation_slot(
+            successor_request_id, slot_offset=slot_offset
+        )
+        local = {
+            "nonce": nonce,
+            "successor_request_id": successor_request_id,
+            "slot_offset": slot_offset,
+            "before_slot_digest": before.slot_digest,
+            "after_slot_digest": after.slot_digest,
+            "pipeline_parallel_rank": self.ps.pp_rank,
+            "tensor_parallel_rank": self.ps.tp_rank,
+            "kv_group_id": "group-0",
+            "injection_applied": before.slot_digest != after.slot_digest,
+        }
+        return self.world_group.all_gather_object(local)
+
     def retire_release_scope(
         self, *, tenant_id: str, scope_id: str, retired_epoch: int, nonce: str
     ) -> List[Dict[str, Any]]:

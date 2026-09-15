@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable
 
 
@@ -305,6 +305,24 @@ class RetireKVInheritanceRegistry:
         del self._reservations[successor_request_id]
         self._reserved_sources.pop(reservation.source_key, None)
         return self._snapshots.get(reservation.source_key)
+
+    def test_corrupt_reservation_slot(
+        self, successor_request_id: str, *, slot_offset: int
+    ) -> tuple[RetireResumeReservation, RetireResumeReservation]:
+        """Change one expected slot for an explicitly gated launch-rejection test."""
+
+        reservation = self._reservations.get(successor_request_id)
+        if reservation is None:
+            raise RetireKVInheritanceError("successor reservation does not exist")
+        if not isinstance(slot_offset, int) or isinstance(slot_offset, bool):
+            raise RetireKVInheritanceError("slot offset must be an integer")
+        if slot_offset < 0 or slot_offset >= len(reservation.slot_ids):
+            raise RetireKVInheritanceError("slot offset is outside the reservation")
+        corrupted_slots = list(reservation.slot_ids)
+        corrupted_slots[slot_offset] += 1
+        corrupted = replace(reservation, slot_ids=tuple(corrupted_slots))
+        self._reservations[successor_request_id] = corrupted
+        return reservation, corrupted
 
     def pop_unreserved_scope(
         self, tenant_id: str, scope_id: str, retired_epoch: int

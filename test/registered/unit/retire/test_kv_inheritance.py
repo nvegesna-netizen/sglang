@@ -284,6 +284,43 @@ class TestRetireKVInheritanceRegistry(unittest.TestCase):
             {"pinned_prefixes": 1, "pending_reservations": 1},
         )
 
+    def test_fault_corruption_changes_only_reserved_expected_slot(self):
+        registry = RetireKVInheritanceRegistry()
+        snapshot = prefix()
+        registry.install(snapshot)
+        reservation = registry.reserve(
+            tenant_id="tenant",
+            scope_id="scope",
+            retired_epoch=0,
+            source_request_id="old",
+            successor_request_id="new",
+            new_epoch=1,
+            generation=3,
+            reuse_tokens=4,
+            block_size=4,
+            cache_salt="shared-salt",
+            successor_token_ids=snapshot.token_ids,
+        )
+
+        before, after = registry.test_corrupt_reservation_slot("new", slot_offset=2)
+        self.assertEqual(before, reservation)
+        self.assertEqual(after.slot_ids, (30, 31, 33, 33))
+        self.assertNotEqual(after.slot_digest, before.slot_digest)
+        self.assertEqual(
+            registry.snapshot(), {"pinned_prefixes": 1, "pending_reservations": 1}
+        )
+        with self.assertRaisesRegex(RetireKVInheritanceError, "physical slots"):
+            registry.verify_launch(
+                successor_request_id="new",
+                tenant_id="tenant",
+                scope_id="scope",
+                epoch=1,
+                generation=3,
+                cache_salt="shared-salt",
+                token_ids=snapshot.token_ids,
+                slot_ids=snapshot.slot_ids[:4],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
