@@ -5474,6 +5474,41 @@ class Scheduler(
         }
         return self.world_group.all_gather_object(local)
 
+    def retire_cancel_resume(
+        self,
+        *,
+        tenant_id: str,
+        scope_id: str,
+        retired_epoch: int,
+        successor_request_id: str,
+        nonce: str,
+    ) -> List[Dict[str, Any]]:
+        snapshot = self.retire_kv_inheritance.cancel_reservation(
+            successor_request_id,
+            expected_source_scope=(tenant_id, scope_id, retired_epoch),
+        )
+        candidates = self.retire_kv_inheritance.pop_unreserved_scope(
+            tenant_id, scope_id, retired_epoch
+        )
+        released = self._retire_release_snapshots(candidates)
+        state = self.retire_kv_inheritance.scope_state(
+            tenant_id, scope_id, retired_epoch
+        )
+        local = {
+            "nonce": nonce,
+            "tenant_id": tenant_id,
+            "scope_id": scope_id,
+            "retired_epoch": retired_epoch,
+            "successor_request_id": successor_request_id,
+            "pipeline_parallel_rank": self.ps.pp_rank,
+            "tensor_parallel_rank": self.ps.tp_rank,
+            "kv_group_id": "group-0",
+            "reservation_cancelled": snapshot is not None,
+            "released_tokens": released,
+            **state,
+        }
+        return self.world_group.all_gather_object(local)
+
     def retire_release_scope(
         self, *, tenant_id: str, scope_id: str, retired_epoch: int, nonce: str
     ) -> List[Dict[str, Any]]:

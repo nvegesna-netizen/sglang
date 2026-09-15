@@ -226,6 +226,33 @@ class TestRetireKVInheritanceRegistry(unittest.TestCase):
             registry.pop_unreserved_scope("tenant", "scope", 0), (snapshot,)
         )
 
+    def test_cancel_rejects_a_different_source_scope_without_mutation(self):
+        registry = RetireKVInheritanceRegistry()
+        snapshot = prefix()
+        registry.install(snapshot)
+        registry.reserve(
+            tenant_id="tenant",
+            scope_id="scope",
+            retired_epoch=0,
+            source_request_id="old",
+            successor_request_id="new",
+            new_epoch=1,
+            generation=3,
+            reuse_tokens=4,
+            block_size=4,
+            cache_salt="shared-salt",
+            successor_token_ids=snapshot.token_ids,
+        )
+
+        with self.assertRaisesRegex(RetireKVInheritanceError, "different source scope"):
+            registry.cancel_reservation(
+                "new", expected_source_scope=("other", "scope", 0)
+            )
+        self.assertEqual(
+            registry.snapshot(),
+            {"pinned_prefixes": 1, "pending_reservations": 1},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

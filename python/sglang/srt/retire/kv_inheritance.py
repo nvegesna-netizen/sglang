@@ -258,11 +258,22 @@ class RetireKVInheritanceRegistry:
         return snapshot, reservation
 
     def cancel_reservation(
-        self, successor_request_id: str
+        self,
+        successor_request_id: str,
+        *,
+        expected_source_scope: tuple[str, str, int] | None = None,
     ) -> RetirePinnedPrefix | None:
-        reservation = self._reservations.pop(successor_request_id, None)
+        reservation = self._reservations.get(successor_request_id)
         if reservation is None:
             return None
+        if (
+            expected_source_scope is not None
+            and reservation.source_key[:3] != expected_source_scope
+        ):
+            raise RetireKVInheritanceError(
+                "successor reservation belongs to a different source scope"
+            )
+        del self._reservations[successor_request_id]
         self._reserved_sources.pop(reservation.source_key, None)
         return self._snapshots.get(reservation.source_key)
 
