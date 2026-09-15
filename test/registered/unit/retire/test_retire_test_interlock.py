@@ -170,6 +170,64 @@ class TestRetireTestInterlock(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(paused)
         self.assertFalse((self.root / "reached.json").exists())
 
+    def test_synchronous_reach_and_poll_are_nonblocking_and_idempotent(self):
+        self.write_arm(component="scheduler", point="scheduler_before_result_commit")
+        with patch.dict(os.environ, self.environment(), clear=False):
+            interlock = RetireTestInterlock.from_environment("scheduler")
+            assert interlock is not None
+            reached = interlock.reach(
+                point="scheduler_before_result_commit",
+                request_id="request-1",
+                authority=authority(),
+            )
+            self.assertTrue(reached)
+            self.assertTrue((self.root / "reached.json").is_file())
+            self.assertFalse(interlock.poll_release())
+
+            # A cooperative caller may encounter the same deferred item more than
+            # once. Reaching it again must not overwrite its immutable receipt.
+            reached_bytes = (self.root / "reached.json").read_bytes()
+            self.assertTrue(
+                interlock.reach(
+                    point="scheduler_before_result_commit",
+                    request_id="request-1",
+                    authority=authority(),
+                )
+            )
+            self.assertEqual((self.root / "reached.json").read_bytes(), reached_bytes)
+
+            release = {
+                "artifact": "retire_test_interlock_release",
+                "schema_version": 1,
+                "nonce": "nonce-1",
+                "component": "scheduler",
+                "point": "scheduler_before_result_commit",
+                "request_id": "request-1",
+                "advance_receipt_sha256": "b" * 64,
+                "injection_applied": True,
+            }
+            (self.root / "release.json").write_text(
+                json.dumps(release, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(
+                interlock.poll_release_after_authority_advance(
+                    authority_is_current=True
+                )
+            )
+            self.assertTrue(
+                interlock.poll_release_after_authority_advance(
+                    authority_is_current=False
+                )
+            )
+            self.assertTrue(interlock.poll_release())
+
+        completed = json.loads(
+            (self.root / "completed.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(completed["advance_receipt_sha256"], "b" * 64)
+        self.assertEqual(completed["authority"], authority().to_dict())
+
     def test_interlock_directory_requires_explicit_fault_gate(self):
         self.write_arm()
         environment = {"SGLANG_RETIRE_TEST_INTERLOCK_DIR": str(self.root)}
@@ -269,6 +327,220 @@ class TestRetireTestInterlock(unittest.IsolatedAsyncioTestCase):
         self.assertLess(publication_pause_line, publication_gate_line)
         self.assertTrue(output_yield_lines)
         self.assertLess(publication_gate_line, min(output_yield_lines))
+
+    def test_scheduler_result_interlock_preserves_authority_ingestion_order(self):
+        scheduler_path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/managers/scheduler.py"
+        )
+        tree = ast.parse(scheduler_path.read_text(encoding="utf-8"))
+        event_loop = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "event_loop_normal"
+        )
+
+        def call_lines(method):
+            return [
+                item.lineno
+                for item in ast.walk(event_loop)
+                if isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Attribute)
+                and item.func.attr == method
+            ]
+
+        ingest_line = call_lines("ingest_requests")[0]
+        admission_poll_line = call_lines("_retire_poll_deferred_admission")[0]
+        poll_line = call_lines("_retire_poll_deferred_result")[0]
+        output_poll_line = call_lines("retire_poll_deferred_output")[0]
+        run_line = call_lines("run_batch")[0]
+        defer_line = call_lines("_retire_defer_before_result_commit")[0]
+        result_line = call_lines("process_batch_result")[0]
+        self.assertLess(ingest_line, admission_poll_line)
+        self.assertLess(admission_poll_line, poll_line)
+        self.assertLess(poll_line, output_poll_line)
+        self.assertLess(run_line, defer_line)
+        self.assertLess(defer_line, result_line)
+
+        init_method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "init_retire_test_interlock"
+        )
+        init_constants = {
+            item.value
+            for item in ast.walk(init_method)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+        self.assertIn("scheduler_before_result_commit", init_constants)
+        self.assertIn("scheduler_after_admission_before_model_launch", init_constants)
+        self.assertTrue(
+            any("overlap scheduling disabled" in value for value in init_constants)
+        )
+        self.assertTrue(
+            any("single scheduler rank" in value for value in init_constants)
+        )
+
+    def test_detokenizer_interlock_polls_without_blocking_authority_input(self):
+        detokenizer_path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/managers/detokenizer_manager.py"
+        )
+        tree = ast.parse(detokenizer_path.read_text(encoding="utf-8"))
+        event_loop = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "event_loop"
+        )
+
+        def call_lines(method):
+            return [
+                item.lineno
+                for item in ast.walk(event_loop)
+                if isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Attribute)
+                and item.func.attr == method
+            ]
+
+        poll_deferred_line = call_lines("_retire_poll_deferred_output")[0]
+        socket_poll_line = call_lines("poll")[0]
+        socket_recv_line = next(
+            item.lineno
+            for item in ast.walk(event_loop)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Name)
+            and item.func.id == "sock_recv"
+        )
+        defer_line = call_lines("_retire_defer_after_validation")[0]
+        dispatch_line = call_lines("_request_dispatcher")[0]
+        self.assertLess(poll_deferred_line, socket_poll_line)
+        self.assertLess(socket_poll_line, socket_recv_line)
+        self.assertLess(socket_recv_line, defer_line)
+        self.assertLess(defer_line, dispatch_line)
+
+        defer_method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_retire_defer_after_validation"
+        )
+        validation_line = next(
+            item.lineno
+            for item in ast.walk(defer_method)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Attribute)
+            and item.func.attr == "_retire_validate_batch_token_id_output"
+        )
+        reach_line = next(
+            item.lineno
+            for item in ast.walk(defer_method)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Attribute)
+            and item.func.attr == "reach"
+        )
+        self.assertLess(validation_line, reach_line)
+        point_constants = {
+            item.value
+            for item in ast.walk(defer_method)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+        self.assertIn(
+            "detokenizer_after_validation_before_publication", point_constants
+        )
+
+        poll_method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_retire_poll_deferred_output"
+        )
+        poll_calls = {
+            item.func.attr
+            for item in ast.walk(poll_method)
+            if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute)
+        }
+        self.assertIn("poll_release_after_authority_advance", poll_calls)
+        self.assertIn("is_current", poll_calls)
+
+    def test_scheduler_admission_interlock_follows_waiting_queue_append(self):
+        scheduler_path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/managers/scheduler.py"
+        )
+        tree = ast.parse(scheduler_path.read_text(encoding="utf-8"))
+        add_request = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_add_request_to_queue"
+        )
+        append_line = next(
+            item.lineno
+            for item in ast.walk(add_request)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Attribute)
+            and item.func.attr == "append"
+            and isinstance(item.func.value, ast.Attribute)
+            and item.func.value.attr == "waiting_queue"
+        )
+        interlock_line = next(
+            item.lineno
+            for item in ast.walk(add_request)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Attribute)
+            and item.func.attr == "_retire_defer_after_admission"
+        )
+        self.assertLess(append_line, interlock_line)
+
+    def test_scheduler_output_interlock_precedes_payload_send(self):
+        output_path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/managers/scheduler_components/output_streamer.py"
+        )
+        tree = ast.parse(output_path.read_text(encoding="utf-8"))
+        stream = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_stream_output_generation"
+        )
+
+        def call_line(method):
+            return next(
+                item.lineno
+                for item in ast.walk(stream)
+                if isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Attribute)
+                and item.func.attr == method
+            )
+
+        payload_line = call_line("to_payload")
+        defer_line = call_line("_retire_defer_before_output")
+        send_line = call_line("_send_generation_payload")
+        self.assertLess(payload_line, defer_line)
+        self.assertLess(defer_line, send_line)
+
+        poll_method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "retire_poll_deferred_output"
+        )
+        constants = {
+            item.value
+            for item in ast.walk(poll_method)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+        calls = {
+            item.func.attr
+            for item in ast.walk(poll_method)
+            if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute)
+        }
+        self.assertIn("poll_release_after_authority_advance", calls)
+        self.assertIn("_send_generation_payload", calls)
+        self.assertIn("type", constants)
+        self.assertIn("abort", constants)
 
 
 if __name__ == "__main__":

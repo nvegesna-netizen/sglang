@@ -144,6 +144,8 @@ class RetireTestInterlock:
         self.root = root
         self.component = component
         self.arm = arm
+        self._reached_authority: RetireAuthorityTag | None = None
+        self._deadline: float | None = None
         self._completed = False
 
     @classmethod
@@ -185,7 +187,7 @@ class RetireTestInterlock:
             and authority == self.arm.authority
         )
 
-    async def pause_async(
+    def reach(
         self,
         *,
         point: str,
@@ -195,6 +197,12 @@ class RetireTestInterlock:
         if not self.matches(point=point, request_id=request_id, authority=authority):
             return False
         assert authority is not None
+        if self._reached_authority is not None:
+            if self._reached_authority != authority:
+                raise RetireTestInterlockError(
+                    "test interlock reached with conflicting authority"
+                )
+            return True
         reached = {
             "artifact": "retire_test_interlock_reached",
             "schema_version": 1,
@@ -208,15 +216,28 @@ class RetireTestInterlock:
             "injection_applied": True,
         }
         _atomic_json(self.root / "reached.json", reached)
+        self._reached_authority = authority
+        self._deadline = time.monotonic() + self.arm.timeout_s
+        return True
 
-        deadline = time.monotonic() + self.arm.timeout_s
+    def poll_release(self) -> bool:
+        """Complete a reached interlock without blocking its caller.
+
+        Synchronous runtime loops call this method while cooperatively deferring the
+        armed item. It returns ``False`` until the controller publishes a release,
+        returns ``True`` after completion, and fails closed after the arm timeout.
+        """
+        if self._completed:
+            return True
+        if self._reached_authority is None or self._deadline is None:
+            return False
         release_path = self.root / "release.json"
-        while not release_path.is_file():
-            if time.monotonic() >= deadline:
+        if not release_path.is_file():
+            if time.monotonic() >= self._deadline:
                 raise RetireTestInterlockError(
-                    f"timed out waiting to release {self.component}:{point}"
+                    f"timed out waiting to release {self.component}:{self.arm.point}"
                 )
-            await asyncio.sleep(0.001)
+            return False
         release, release_sha256 = _read_json_object(
             release_path, expected_keys=_RELEASE_KEYS
         )
@@ -225,8 +246,8 @@ class RetireTestInterlock:
             "schema_version": 1,
             "nonce": self.arm.nonce,
             "component": self.component,
-            "point": point,
-            "request_id": request_id,
+            "point": self.arm.point,
+            "request_id": self.arm.request_id,
             "injection_applied": True,
         }
         for field, value in expected.items():
@@ -248,9 +269,9 @@ class RetireTestInterlock:
             "schema_version": 1,
             "nonce": self.arm.nonce,
             "component": self.component,
-            "point": point,
-            "request_id": request_id,
-            "authority": authority.to_dict(),
+            "point": self.arm.point,
+            "request_id": self.arm.request_id,
+            "authority": self._reached_authority.to_dict(),
             "advance_receipt_sha256": receipt_sha,
             "release_sha256": release_sha256,
             "completed_monotonic_ns": time.monotonic_ns(),
@@ -258,4 +279,38 @@ class RetireTestInterlock:
         }
         _atomic_json(self.root / "completed.json", completed)
         self._completed = True
+        return True
+
+    def require_within_timeout(self, phase: str) -> None:
+        if self._deadline is None:
+            raise RetireTestInterlockError(
+                "test interlock timeout checked before the arm was reached"
+            )
+        if time.monotonic() >= self._deadline:
+            raise RetireTestInterlockError(
+                f"timed out waiting for {self.component}:{phase}"
+            )
+
+    def poll_release_after_authority_advance(
+        self, *, authority_is_current: bool
+    ) -> bool:
+        """Wait cooperatively for both controller release and local advance."""
+        if not self.poll_release():
+            return False
+        if authority_is_current:
+            self.require_within_timeout("local authority advance")
+            return False
+        return True
+
+    async def pause_async(
+        self,
+        *,
+        point: str,
+        request_id: str,
+        authority: RetireAuthorityTag | None,
+    ) -> bool:
+        if not self.reach(point=point, request_id=request_id, authority=authority):
+            return False
+        while not self.poll_release():
+            await asyncio.sleep(0.001)
         return True

@@ -49,6 +49,10 @@ from sglang.srt.retire.authority import (
     RetireAuthorityError,
     RetireAuthorityTable,
 )
+from sglang.srt.retire.test_interlock import (
+    RetireTestInterlock,
+    RetireTestInterlockError,
+)
 from sglang.srt.retire.kv_inheritance import (
     RetireKVInheritanceError,
     RetireKVInheritanceRegistry,
@@ -554,6 +558,7 @@ class Scheduler(
             moe_dp_size=get_parallel().moe_dp_size,
             gpu_id=gpu_id,
         )
+        self.init_retire_test_interlock()
 
         # Init model configs
         self.init_model_config()
@@ -740,6 +745,120 @@ class Scheduler(
 
         self.is_initializing = False
         self.init_startup_timing_summary()
+
+    def init_retire_test_interlock(self) -> None:
+        self.retire_test_interlock = RetireTestInterlock.from_environment("scheduler")
+        self._retire_deferred_admission = None
+        self._retire_deferred_result = None
+        interlock = self.retire_test_interlock
+        if interlock is None:
+            return
+        if interlock.arm.point not in {
+            "scheduler_after_admission_before_model_launch",
+            "scheduler_before_result_commit",
+            "scheduler_before_output",
+        }:
+            raise RetireTestInterlockError(
+                f"unsupported scheduler test interlock point {interlock.arm.point!r}"
+            )
+        if self.enable_overlap or self.enable_overlap_mlx:
+            raise RetireTestInterlockError(
+                "scheduler test interlocks require overlap scheduling disabled"
+            )
+        if any(
+            size != 1
+            for size in (
+                self.ps.tp_size,
+                self.ps.pp_size,
+                self.ps.dp_size,
+                self.ps.attn_cp_size,
+                self.ps.moe_ep_size,
+            )
+        ):
+            raise RetireTestInterlockError(
+                "scheduler test interlocks require a single scheduler rank"
+            )
+
+    def _retire_defer_before_result_commit(
+        self,
+        batch: ScheduleBatch,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+    ) -> bool:
+        interlock = self.retire_test_interlock
+        if interlock is None:
+            return False
+        for req in batch.reqs:
+            if interlock.reach(
+                point="scheduler_before_result_commit",
+                request_id=req.rid,
+                authority=req.retire_authority,
+            ):
+                if self._retire_deferred_result is not None:
+                    raise RetireTestInterlockError(
+                        "scheduler already has a deferred RETIRE result"
+                    )
+                self._retire_deferred_result = (batch, result)
+                return True
+        return False
+
+    def _retire_defer_after_admission(self, req: Req) -> bool:
+        interlock = self.retire_test_interlock
+        if interlock is None or not interlock.reach(
+            point="scheduler_after_admission_before_model_launch",
+            request_id=req.rid,
+            authority=req.retire_authority,
+        ):
+            return False
+        if self._retire_deferred_admission is not None:
+            raise RetireTestInterlockError(
+                "scheduler already has a deferred RETIRE admission"
+            )
+        self._retire_deferred_admission = req
+        return True
+
+    def _retire_poll_deferred_admission(self) -> bool:
+        req = self._retire_deferred_admission
+        if req is None:
+            return True
+        interlock = self.retire_test_interlock
+        if interlock is None:
+            raise RetireTestInterlockError(
+                "scheduler lost its RETIRE test interlock while admission was deferred"
+            )
+        if not interlock.poll_release_after_authority_advance(
+            authority_is_current=self.retire_authority.is_current(req.retire_authority)
+        ):
+            return False
+        self._retire_deferred_admission = None
+        return True
+
+    def _retire_poll_deferred_result(self) -> bool:
+        deferred = self._retire_deferred_result
+        if deferred is None:
+            return True
+        interlock = self.retire_test_interlock
+        if interlock is None:
+            raise RetireTestInterlockError(
+                "scheduler lost its RETIRE test interlock while a result was deferred"
+            )
+        batch, result = deferred
+        matched_req = next(
+            (req for req in batch.reqs if req.rid == interlock.arm.request_id),
+            None,
+        )
+        if matched_req is None:
+            raise RetireTestInterlockError(
+                "deferred scheduler result lost the armed request"
+            )
+        if not interlock.poll_release_after_authority_advance(
+            authority_is_current=self.retire_authority.is_current(
+                matched_req.retire_authority
+            )
+        ):
+            return False
+        self._retire_deferred_result = None
+        self.process_batch_result(batch, result)
+        return True
 
     def init_startup_timing_begin(self) -> None:
         self.scheduler_startup_begin = time.perf_counter()
@@ -1927,6 +2046,12 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
+            if not self._retire_poll_deferred_admission():
+                continue
+            if not self._retire_poll_deferred_result():
+                continue
+            if not self.output_streamer.retire_poll_deferred_output():
+                continue
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -1942,7 +2067,8 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                if not self._retire_defer_before_result_commit(batch, result):
+                    self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
@@ -2478,6 +2604,7 @@ class Scheduler(
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
             retire_is_current=self.retire_authority.is_current,
+            retire_test_interlock=self.retire_test_interlock,
             rust_server=self.rust_server,
         )
 
@@ -3237,6 +3364,7 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
+            self._retire_defer_after_admission(req)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(

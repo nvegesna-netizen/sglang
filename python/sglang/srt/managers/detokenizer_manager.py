@@ -48,6 +48,10 @@ from sglang.srt.retire.authority import (
     RetireAuthorityTable,
     RetireAuthorityTag,
 )
+from sglang.srt.retire.test_interlock import (
+    RetireTestInterlock,
+    RetireTestInterlockError,
+)
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.runtime_context import (
     get_device,
@@ -114,6 +118,21 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         port_args: PortArgs,
     ):
         self.retire_authority = RetireAuthorityTable()
+        self.retire_test_interlock = RetireTestInterlock.from_environment("detokenizer")
+        self._retire_deferred_output: BatchTokenIDOutput | None = None
+        if self.retire_test_interlock is not None:
+            if (
+                self.retire_test_interlock.arm.point
+                != "detokenizer_after_validation_before_publication"
+            ):
+                raise RetireTestInterlockError(
+                    "unsupported detokenizer test interlock point "
+                    f"{self.retire_test_interlock.arm.point!r}"
+                )
+            if get_serving().tokenizer_worker_num != 1:
+                raise RetireTestInterlockError(
+                    "detokenizer publication interlock requires one tokenizer worker"
+                )
         # Init inter-process communication
         self.init_ipc_channels(port_args, server_args)
 
@@ -199,12 +218,79 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
+            if self._retire_poll_deferred_output():
+                self.soft_watchdog.feed()
+                continue
             with self.soft_watchdog.disable():
+                if (
+                    self._retire_deferred_output is not None
+                    and not self.recv_from_scheduler.poll(timeout=1)
+                ):
+                    continue
                 recv_obj = sock_recv(self.recv_from_scheduler)
+            if self._retire_defer_after_validation(recv_obj):
+                self.soft_watchdog.feed()
+                continue
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 sock_send(self.send_to_tokenizer, output)
             self.soft_watchdog.feed()
+
+    def _retire_defer_after_validation(self, recv_obj: object) -> bool:
+        interlock = self.retire_test_interlock
+        if (
+            interlock is None
+            or self._retire_deferred_output is not None
+            or not isinstance(recv_obj, BatchTokenIDOutput)
+            or recv_obj.retire_authorities is None
+        ):
+            return False
+        if len(recv_obj.retire_authorities) != len(recv_obj.rids):
+            raise RetireAuthorityError(
+                "RETIRE output authority count does not match request count"
+            )
+        self._retire_validate_batch_token_id_output(recv_obj)
+        for rid, raw_tag in zip(
+            recv_obj.rids, recv_obj.retire_authorities, strict=True
+        ):
+            tag = RetireAuthorityTag.from_value(raw_tag)
+            if not interlock.reach(
+                point="detokenizer_after_validation_before_publication",
+                request_id=rid,
+                authority=tag,
+            ):
+                continue
+            if len(recv_obj.rids) != 1:
+                raise RetireTestInterlockError(
+                    "detokenizer publication interlock requires a one-request output"
+                )
+            self._retire_deferred_output = recv_obj
+            return True
+        return False
+
+    def _retire_poll_deferred_output(self) -> bool:
+        recv_obj = self._retire_deferred_output
+        if recv_obj is None:
+            return False
+        interlock = self.retire_test_interlock
+        if interlock is None:
+            raise RetireTestInterlockError(
+                "detokenizer lost its RETIRE test interlock while output was deferred"
+            )
+        tag = RetireAuthorityTag.from_value(recv_obj.retire_authorities[0])
+        if not interlock.poll_release_after_authority_advance(
+            authority_is_current=self.retire_authority.is_current(tag)
+        ):
+            return False
+
+        self._retire_deferred_output = None
+        reason = recv_obj.finished_reasons[0] or {}
+        has_payload = bool(recv_obj.output_ids and recv_obj.output_ids[0])
+        if reason.get("type") == "abort" and not has_payload:
+            output = self._request_dispatcher(recv_obj)
+            if output is not None:
+                sock_send(self.send_to_tokenizer, output)
+        return True
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
@@ -461,33 +547,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         ]
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
-        stale_terminal_indices = set()
-        if recv_obj.retire_authorities is not None:
-            if len(recv_obj.retire_authorities) != len(recv_obj.rids):
-                raise RetireAuthorityError(
-                    "RETIRE output authority count does not match request count"
-                )
-            for i, (rid, raw_tag) in enumerate(
-                zip(recv_obj.rids, recv_obj.retire_authorities, strict=True)
-            ):
-                tag = RetireAuthorityTag.from_value(raw_tag)
-                try:
-                    if tag is not None:
-                        self.retire_authority.bind(rid, tag)
-                except RetireAuthorityError:
-                    pass
-                if self.retire_authority.is_current(tag):
-                    continue
-                reason = recv_obj.finished_reasons[i] or {}
-                if reason.get("type") != "abort":
-                    raise RetireAuthorityError(
-                        "stale RETIRE output was not a terminal abort"
-                    )
-                if recv_obj.output_ids is not None and recv_obj.output_ids[i]:
-                    raise RetireAuthorityError(
-                        "stale RETIRE terminal carried output token payload"
-                    )
-                stale_terminal_indices.add(i)
+        stale_terminal_indices = self._retire_validate_batch_token_id_output(recv_obj)
         # Beam decoding is additive: a batch may mix beam leaders with normal
         # requests, so every item still goes through the standard decode.
         if is_beam_search_batch(recv_obj):
@@ -559,6 +619,38 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
         )
+
+    def _retire_validate_batch_token_id_output(
+        self, recv_obj: BatchTokenIDOutput
+    ) -> set[int]:
+        stale_terminal_indices = set()
+        if recv_obj.retire_authorities is not None:
+            if len(recv_obj.retire_authorities) != len(recv_obj.rids):
+                raise RetireAuthorityError(
+                    "RETIRE output authority count does not match request count"
+                )
+            for i, (rid, raw_tag) in enumerate(
+                zip(recv_obj.rids, recv_obj.retire_authorities, strict=True)
+            ):
+                tag = RetireAuthorityTag.from_value(raw_tag)
+                try:
+                    if tag is not None:
+                        self.retire_authority.bind(rid, tag)
+                except RetireAuthorityError:
+                    pass
+                if self.retire_authority.is_current(tag):
+                    continue
+                reason = recv_obj.finished_reasons[i] or {}
+                if reason.get("type") != "abort":
+                    raise RetireAuthorityError(
+                        "stale RETIRE output was not a terminal abort"
+                    )
+                if recv_obj.output_ids is not None and recv_obj.output_ids[i]:
+                    raise RetireAuthorityError(
+                        "stale RETIRE terminal carried output token payload"
+                    )
+                stale_terminal_indices.add(i)
+        return stale_terminal_indices
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager")

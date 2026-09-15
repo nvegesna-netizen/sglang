@@ -32,6 +32,11 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.retire.authority import RetireAuthorityTag
+from sglang.srt.retire.test_interlock import (
+    RetireTestInterlock,
+    RetireTestInterlockError,
+)
 from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -60,11 +65,15 @@ class SchedulerOutputStreamer:
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
     retire_is_current: Callable[[Any], bool] = lambda _: True
+    retire_test_interlock: Optional[RetireTestInterlock] = None
     # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
     _test_stream_output_count: int = 0
+    _retire_deferred_payload: Optional[BatchTokenIDOutput] = field(
+        default=None, init=False
+    )
 
     def __post_init__(self) -> None:
         if self.has_additional_customized_info and self.rust_server is not None:
@@ -218,10 +227,65 @@ class SchedulerOutputStreamer:
             is_idle_batch=is_idle_batch,
         )
         if payload is not None:
-            if self.rust_server is not None:
-                self.rust_server.push_generation(payload)
-            else:
-                self.send_to_detokenizer.send_output(payload)
+            if self._retire_defer_before_output(payload):
+                return
+            self._send_generation_payload(payload)
+
+    def _send_generation_payload(self, payload: BatchTokenIDOutput) -> None:
+        if self.rust_server is not None:
+            self.rust_server.push_generation(payload)
+        else:
+            self.send_to_detokenizer.send_output(payload)
+
+    def _retire_defer_before_output(self, payload: BatchTokenIDOutput) -> bool:
+        interlock = self.retire_test_interlock
+        if (
+            interlock is None
+            or self._retire_deferred_payload is not None
+            or payload.retire_authorities is None
+        ):
+            return False
+        if len(payload.retire_authorities) != len(payload.rids):
+            raise RetireTestInterlockError(
+                "scheduler output authority count does not match request count"
+            )
+        for rid, raw_tag in zip(payload.rids, payload.retire_authorities, strict=True):
+            tag = RetireAuthorityTag.from_value(raw_tag)
+            if not interlock.reach(
+                point="scheduler_before_output",
+                request_id=rid,
+                authority=tag,
+            ):
+                continue
+            if len(payload.rids) != 1:
+                raise RetireTestInterlockError(
+                    "scheduler output interlock requires a one-request output"
+                )
+            self._retire_deferred_payload = payload
+            return True
+        return False
+
+    def retire_poll_deferred_output(self) -> bool:
+        payload = self._retire_deferred_payload
+        if payload is None:
+            return True
+        interlock = self.retire_test_interlock
+        if interlock is None:
+            raise RetireTestInterlockError(
+                "scheduler lost its RETIRE test interlock while output was deferred"
+            )
+        tag = RetireAuthorityTag.from_value(payload.retire_authorities[0])
+        if not interlock.poll_release_after_authority_advance(
+            authority_is_current=self.retire_is_current(tag)
+        ):
+            return False
+
+        self._retire_deferred_payload = None
+        reason = payload.finished_reasons[0] or {}
+        has_payload = bool(payload.output_ids and payload.output_ids[0])
+        if reason.get("type") == "abort" and not has_payload:
+            self._send_generation_payload(payload)
+        return True
 
     def build_additional_customized_info(self, reqs: List[Req]) -> dict[str, list]:
         """Return fields aligned with the emitted requests in ``reqs``.
@@ -466,9 +530,7 @@ class _GenerationStreamAccumulator:
             req.finished_reason.to_json() if req.finished_reason else None
         )
         self.retire_authorities.append(
-            req.retire_authority.to_dict()
-            if req.retire_authority is not None
-            else None
+            req.retire_authority.to_dict() if req.retire_authority is not None else None
         )
         # Exclude the tokens after stop condition
         output_ids_ = req.output_ids_through_stop
