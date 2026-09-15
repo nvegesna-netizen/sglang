@@ -1835,6 +1835,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     continue
                 out = build_beam_search_out(out)
 
+            self._retire_require_client_publication(obj, out)
+
             if finished:
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
@@ -1885,6 +1887,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     raise ValueError(
                         f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
                     )
+
+    def _retire_require_client_publication(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        out: Dict[str, Any],
+    ) -> None:
+        """Recheck authority immediately before a queued frame reaches a caller."""
+        raw_tag = getattr(obj, "retire_authority", None)
+        tag = RetireAuthorityTag.from_value(raw_tag)
+        if tag is None:
+            return
+        meta_info = out.get("meta_info")
+        finish_reason = (
+            meta_info.get("finish_reason") if isinstance(meta_info, dict) else None
+        )
+        terminal_abort = (
+            isinstance(finish_reason, dict) and finish_reason.get("type") == "abort"
+        )
+        has_payload = bool(out.get("output_ids")) or bool(out.get("text"))
+        has_payload = has_payload or out.get("embedding") is not None
+        self.retire_authority.require_publication(
+            tag,
+            terminal_abort=terminal_abort,
+            has_payload=has_payload,
+            phase="tokenizer-manager client publication",
+        )
 
     async def _handle_batch_request(
         self,
@@ -2604,7 +2632,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if expected_raw is None:
             return authorities is None or authorities[index] is None
         if authorities is None:
-            logger.error("Dropping RETIRE output with missing authority, rid=%s", state.obj.rid)
+            logger.error(
+                "Dropping RETIRE output with missing authority, rid=%s", state.obj.rid
+            )
             return False
         try:
             expected = RetireAuthorityTag.from_value(expected_raw)
@@ -2613,20 +2643,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.error("Dropping malformed RETIRE output: %s", error)
             return False
         if observed != expected:
-            logger.error("Dropping RETIRE output with mismatched authority, rid=%s", state.obj.rid)
+            logger.error(
+                "Dropping RETIRE output with mismatched authority, rid=%s",
+                state.obj.rid,
+            )
             return False
         if self.retire_authority.is_current(observed):
             return True
 
         reason = recv_obj.finished_reasons[index] or {}
         if reason.get("type") != "abort":
-            logger.warning("Dropping stale nonterminal RETIRE output, rid=%s", state.obj.rid)
+            logger.warning(
+                "Dropping stale nonterminal RETIRE output, rid=%s", state.obj.rid
+            )
             return False
 
         # Preserve only the terminal abort needed to wake and close the caller.
         if isinstance(recv_obj, BatchStrOutput):
             recv_obj.output_strs[index] = ""
-        if not isinstance(recv_obj, BatchEmbeddingOutput) and recv_obj.output_ids is not None:
+        if (
+            not isinstance(recv_obj, BatchEmbeddingOutput)
+            and recv_obj.output_ids is not None
+        ):
             recv_obj.output_ids[index] = array("q")
         for field_name in (
             "output_token_logprobs_val",

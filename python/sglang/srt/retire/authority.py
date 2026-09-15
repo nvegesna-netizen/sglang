@@ -183,8 +183,7 @@ class RetireAuthorityTable:
         with self._lock:
             current = self._current.get(tag.scope_key)
             return current is not None and (
-                current.epoch == tag.epoch
-                and current.generation == tag.generation
+                current.epoch == tag.epoch and current.generation == tag.generation
             )
 
     def require_current(self, tag: RetireAuthorityTag | None, phase: str) -> None:
@@ -195,6 +194,31 @@ class RetireAuthorityTable:
                 f"tenant={tag.tenant_id!r} scope={tag.scope_id!r} "
                 f"epoch={tag.epoch} generation={tag.generation}"
             )
+
+    def require_publication(
+        self,
+        tag: RetireAuthorityTag | None,
+        *,
+        terminal_abort: bool,
+        has_payload: bool,
+        phase: str,
+    ) -> None:
+        """Fail closed at a publication boundary after an earlier admission check.
+
+        A retired request may emit only an empty terminal abort so an awaiting
+        caller can close. Any data-bearing or nonterminal frame is stale even if
+        an earlier component admitted it before the authority advance.
+        """
+        if self.is_current(tag):
+            return
+        if terminal_abort and not has_payload:
+            return
+        assert tag is not None
+        raise RetireAuthorityError(
+            f"stale RETIRE authority at {phase}: "
+            f"tenant={tag.tenant_id!r} scope={tag.scope_id!r} "
+            f"epoch={tag.epoch} generation={tag.generation}"
+        )
 
     def current(self, tenant_id: str, scope_id: str) -> RetireAuthorityTag | None:
         with self._lock:

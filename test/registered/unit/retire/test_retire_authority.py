@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import sys
 import threading
@@ -19,6 +20,10 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[4] / "python/sglang/srt/retire/authority.py"
+)
+TOKENIZER_MANAGER_PATH = (
+    Path(__file__).resolve().parents[4]
+    / "python/sglang/srt/managers/tokenizer_manager.py"
 )
 SPEC = importlib.util.spec_from_file_location("sglang_retire_authority", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -155,6 +160,92 @@ class TestRetireAuthority(unittest.TestCase):
         self.assertFalse(table.is_current(tag(0, 1)))
         with self.assertRaises(RetireAuthorityError):
             table.require_current(tag(0, 1), "pre-launch")
+
+    def test_publication_rechecks_frame_admitted_before_advance(self):
+        table = RetireAuthorityTable()
+        old = tag(0, 1)
+        table.bind("old", old)
+
+        # This is the earlier component's output-admission check.
+        table.require_publication(
+            old,
+            terminal_abort=False,
+            has_payload=True,
+            phase="tokenizer enqueue",
+        )
+        table.advance(
+            tenant_id="tenant",
+            scope_id="scope",
+            retired_epoch=0,
+            new_epoch=1,
+            generation=2,
+        )
+
+        with self.assertRaisesRegex(
+            RetireAuthorityError, "tokenizer-manager client publication"
+        ):
+            table.require_publication(
+                old,
+                terminal_abort=False,
+                has_payload=True,
+                phase="tokenizer-manager client publication",
+            )
+
+    def test_retired_publication_allows_only_empty_terminal_abort(self):
+        table = RetireAuthorityTable()
+        old = tag(0, 1)
+        table.bind("old", old)
+        table.advance(
+            tenant_id="tenant",
+            scope_id="scope",
+            retired_epoch=0,
+            new_epoch=1,
+            generation=2,
+        )
+
+        table.require_publication(
+            old,
+            terminal_abort=True,
+            has_payload=False,
+            phase="tokenizer-manager client publication",
+        )
+        for terminal_abort, has_payload in ((False, False), (True, True)):
+            with (
+                self.subTest(terminal_abort=terminal_abort, has_payload=has_payload),
+                self.assertRaises(RetireAuthorityError),
+            ):
+                table.require_publication(
+                    old,
+                    terminal_abort=terminal_abort,
+                    has_payload=has_payload,
+                    phase="tokenizer-manager client publication",
+                )
+
+    def test_tokenizer_stream_rechecks_authority_before_every_client_yield(self):
+        tree = ast.parse(TOKENIZER_MANAGER_PATH.read_text(encoding="utf-8"))
+        stream = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_stream_one_response"
+        )
+        gate_lines = [
+            node.lineno
+            for node in ast.walk(stream)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_retire_require_client_publication"
+        ]
+        output_yield_lines = [
+            node.lineno
+            for node in ast.walk(stream)
+            if isinstance(node, ast.Yield)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in {"out", "abort_out"}
+        ]
+        self.assertEqual(len(gate_lines), 1)
+        self.assertTrue(output_yield_lines)
+        self.assertLess(gate_lines[0], min(output_yield_lines))
 
 
 if __name__ == "__main__":
