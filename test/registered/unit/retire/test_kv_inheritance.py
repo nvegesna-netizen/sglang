@@ -4,6 +4,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 try:
     from sglang.test.ci.ci_register import register_cpu_ci
@@ -30,6 +31,9 @@ SPEC.loader.exec_module(KV)
 RetireKVInheritanceError = KV.RetireKVInheritanceError
 RetireKVInheritanceRegistry = KV.RetireKVInheritanceRegistry
 RetirePinnedPrefix = KV.RetirePinnedPrefix
+acquire_retire_cache_locks = KV.acquire_retire_cache_locks
+configure_retire_cache_insert = KV.configure_retire_cache_insert
+release_retire_cache_lock = KV.release_retire_cache_lock
 sequence_digest = KV.sequence_digest
 standard_cache_is_certifiable = KV.standard_cache_is_certifiable
 
@@ -50,6 +54,90 @@ def prefix(*, request_id: str = "old", generation: int = 2):
 
 
 class TestRetireKVInheritanceRegistry(unittest.TestCase):
+    def test_unified_insert_policy_preserves_protected_boundary(self):
+        params = SimpleNamespace(prev_prefix_len=0, rotation_base=None)
+        self.assertTrue(
+            configure_retire_cache_insert(
+                params,
+                tree_cache_type="UnifiedRadixCache",
+                protected_prefix_len=32,
+                rotation_base=4,
+            )
+        )
+        self.assertEqual(params.prev_prefix_len, 32)
+        self.assertEqual(params.rotation_base, 4)
+
+        legacy = SimpleNamespace(prev_prefix_len=0, rotation_base=None)
+        self.assertFalse(
+            configure_retire_cache_insert(
+                legacy,
+                tree_cache_type="RadixCache",
+                protected_prefix_len=32,
+                rotation_base=4,
+            )
+        )
+        self.assertEqual(legacy.prev_prefix_len, 0)
+        self.assertIsNone(legacy.rotation_base)
+        with self.assertRaisesRegex(RetireKVInheritanceError, "unsupported"):
+            configure_retire_cache_insert(
+                legacy,
+                tree_cache_type="ChunkCache",
+                protected_prefix_len=32,
+                rotation_base=None,
+            )
+
+    def test_persistent_cache_lock_replays_its_exact_release_receipt(self):
+        class Receipt:
+            def __init__(self, value):
+                self.value = value
+
+            def to_dec_params(self):
+                return f"release-{self.value}"
+
+        class Cache:
+            def __init__(self):
+                self.acquires = []
+                self.releases = []
+
+            def inc_lock_ref(self, node):
+                receipt = Receipt(len(self.acquires) + 1)
+                self.acquires.append((node, receipt))
+                return receipt
+
+            def dec_lock_ref(self, node, params):
+                self.releases.append((node, params))
+
+        cache = Cache()
+        request_receipt, persistent = acquire_retire_cache_locks(cache, 17)
+        self.assertEqual(request_receipt.to_dec_params(), "release-1")
+        self.assertEqual(cache.releases, [])
+        release_retire_cache_lock(cache, persistent)
+        self.assertEqual(cache.releases, [(17, "release-2")])
+
+    def test_failed_persistent_lock_acquire_releases_request_lock_receipt(self):
+        class Receipt:
+            def to_dec_params(self):
+                return "release-request"
+
+        class Cache:
+            def __init__(self):
+                self.acquire_count = 0
+                self.releases = []
+
+            def inc_lock_ref(self, node):
+                self.acquire_count += 1
+                if self.acquire_count == 2:
+                    raise RuntimeError("persistent acquire failed")
+                return Receipt()
+
+            def dec_lock_ref(self, node, params):
+                self.releases.append((node, params))
+
+        cache = Cache()
+        with self.assertRaisesRegex(RuntimeError, "persistent acquire failed"):
+            acquire_retire_cache_locks(cache, 17)
+        self.assertEqual(cache.releases, [(17, "release-request")])
+
     def test_only_standard_single_group_cache_is_certifiable(self):
         standard = {
             "hybrid_swa": False,
@@ -59,10 +147,25 @@ class TestRetireKVInheritanceRegistry(unittest.TestCase):
             "disaggregated": False,
             "hierarchical_cache": False,
             "rust_frontend": False,
+            "dcp_enabled": False,
+            "dp_attention": False,
             "kv_pool_type": "PagedTokenToKVPoolAllocator",
             "tree_cache_type": "RadixCache",
+            "tree_component_types": (),
+            "tree_core_type": None,
+            "cache_disabled": False,
+            "external_cache_linker": False,
+            "cache_controller_attached": False,
+            "session_radix_cache": False,
         }
         self.assertTrue(standard_cache_is_certifiable(**standard))
+        unified = {
+            **standard,
+            "tree_cache_type": "UnifiedRadixCache",
+            "tree_component_types": ("FULL",),
+            "tree_core_type": "UnifiedTreeCore",
+        }
+        self.assertTrue(standard_cache_is_certifiable(**unified))
         mutations = {
             "hybrid_swa": True,
             "hybrid_ssm": True,
@@ -71,14 +174,28 @@ class TestRetireKVInheritanceRegistry(unittest.TestCase):
             "disaggregated": True,
             "hierarchical_cache": True,
             "rust_frontend": True,
+            "dcp_enabled": True,
+            "dp_attention": True,
             "kv_pool_type": "TokenToKVPoolAllocator",
             "tree_cache_type": "ChunkCache",
+            "cache_disabled": True,
+            "external_cache_linker": True,
+            "cache_controller_attached": True,
+            "session_radix_cache": True,
         }
         for field, value in mutations.items():
             with self.subTest(field=field):
                 self.assertFalse(
                     standard_cache_is_certifiable(**{**standard, field: value})
                 )
+        for change in (
+            {"tree_component_types": ()},
+            {"tree_component_types": ("FULL", "SWA")},
+            {"tree_core_type": None},
+            {"tree_core_type": "RustTreeCoreAdapter"},
+        ):
+            with self.subTest(change=change):
+                self.assertFalse(standard_cache_is_certifiable(**{**unified, **change}))
 
     def test_sequence_digest_is_length_delimited_and_rejects_negative_values(self):
         self.assertNotEqual(sequence_digest((1, 23)), sequence_digest((12, 3)))

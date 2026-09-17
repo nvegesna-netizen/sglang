@@ -54,6 +54,9 @@ from sglang.srt.retire.test_interlock import (
     RetireTestInterlockError,
 )
 from sglang.srt.retire.kv_inheritance import (
+    acquire_retire_cache_locks,
+    configure_retire_cache_insert,
+    release_retire_cache_lock,
     RetireKVInheritanceError,
     RetireKVInheritanceRegistry,
     RetirePinnedPrefix,
@@ -3336,28 +3339,9 @@ class Scheduler(
             return
         if req.retire_authority is not None:
             unsupported = []
-            if (
-                type(self.token_to_kv_pool_allocator).__name__
-                != "PagedTokenToKVPoolAllocator"
-            ):
-                unsupported.append("non-paged KV allocator")
-            if (
-                type(self.tree_cache).__name__ != "RadixCache"
-                or self.tree_cache.disable
-            ):
-                unsupported.append("non-RadixCache prefix ownership")
-            if self.is_hybrid_swa or self.is_hybrid_ssm:
-                unsupported.append("hybrid KV")
-            if not self.spec_algorithm.is_none():
-                unsupported.append("speculative decoding")
-            if self.dllm_config is not None:
-                unsupported.append("diffusion decoding")
-            if self.disaggregation_mode != DisaggregationMode.NULL:
-                unsupported.append("disaggregation")
-            if self.enable_hierarchical_cache:
-                unsupported.append("hierarchical cache")
-            if self.rust_server is not None:
-                unsupported.append("Rust frontend")
+            cache_topology = self._retire_cache_topology()
+            if cache_topology["cache_topology_certifiable"] is not True:
+                unsupported.append(f"cache topology={cache_topology!r}")
             if req.session is not None or req.session_id is not None:
                 unsupported.append("sessions")
             if req.extra_key is not None:
@@ -5388,6 +5372,59 @@ class Scheduler(
             key=lambda req: req.rid,
         )
 
+    def _retire_cache_topology(self) -> Dict[str, Any]:
+        tree_cache = self.tree_cache
+        component_types = [
+            str(getattr(component, "name", component)).upper()
+            for component in getattr(tree_cache, "tree_components", ())
+        ]
+        tree_core = getattr(tree_cache, "tree_core", None)
+        topology: Dict[str, Any] = {
+            "hybrid_swa": self.is_hybrid_swa,
+            "hybrid_ssm": self.is_hybrid_ssm,
+            "speculative": not self.spec_algorithm.is_none(),
+            "diffusion": self.dllm_config is not None,
+            "disaggregated": self.disaggregation_mode != DisaggregationMode.NULL,
+            "hierarchical_cache": self.enable_hierarchical_cache,
+            "rust_frontend": self.rust_server is not None,
+            "dcp_enabled": get_parallel().dcp_enabled,
+            "dp_attention": self.enable_dp_attention,
+            "kv_pool_type": type(self.token_to_kv_pool_allocator).__name__,
+            "tree_cache_type": type(tree_cache).__name__,
+            "tree_component_types": component_types,
+            "tree_core_type": type(tree_core).__name__
+            if tree_core is not None
+            else None,
+            "cache_disabled": bool(tree_cache.disable),
+            "external_cache_linker": getattr(tree_cache, "linker", None) is not None,
+            "cache_controller_attached": (
+                getattr(tree_cache, "cache_controller", None) is not None
+            ),
+            "session_radix_cache": bool(
+                getattr(tree_cache, "enable_session_radix_cache", False)
+            ),
+        }
+        topology["cache_topology_certifiable"] = standard_cache_is_certifiable(
+            hybrid_swa=topology["hybrid_swa"],
+            hybrid_ssm=topology["hybrid_ssm"],
+            speculative=topology["speculative"],
+            diffusion=topology["diffusion"],
+            disaggregated=topology["disaggregated"],
+            hierarchical_cache=topology["hierarchical_cache"],
+            rust_frontend=topology["rust_frontend"],
+            dcp_enabled=topology["dcp_enabled"],
+            dp_attention=topology["dp_attention"],
+            kv_pool_type=topology["kv_pool_type"],
+            tree_cache_type=topology["tree_cache_type"],
+            tree_component_types=tuple(component_types),
+            tree_core_type=topology["tree_core_type"],
+            cache_disabled=topology["cache_disabled"],
+            external_cache_linker=topology["external_cache_linker"],
+            cache_controller_attached=topology["cache_controller_attached"],
+            session_radix_cache=topology["session_radix_cache"],
+        )
+        return topology
+
     def _retire_pin_committed_prefix(
         self,
         req: Req,
@@ -5395,7 +5432,7 @@ class Scheduler(
         retired_epoch: int,
         generation: int,
     ) -> Optional[RetirePinnedPrefix]:
-        """Transfer a drained, page-aligned request prefix to RadixCache."""
+        """Transfer a drained, page-aligned request prefix to the prefix cache."""
 
         tag = req.retire_authority
         if (
@@ -5430,38 +5467,56 @@ class Scheduler(
             cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         if len(radix_key) != aligned:
-            raise RetireKVInheritanceError("RadixCache changed the aligned frontier")
+            raise RetireKVInheritanceError("prefix cache changed the aligned frontier")
 
-        insert_result = self.tree_cache.insert(
-            InsertParams(
-                key=radix_key,
-                value=original_indices,
-                priority=getattr(req, "priority", 0) or 0,
-            )
+        tree_cache_type = type(self.tree_cache).__name__
+        unified_cache = tree_cache_type == "UnifiedRadixCache"
+        insert_params = InsertParams(
+            key=radix_key,
+            value=original_indices,
+            priority=getattr(req, "priority", 0) or 0,
         )
+        # UnifiedRadixCache releases duplicate request-owned rows while
+        # inserting. Preserve the already cache-owned prefix boundary so it
+        # never frees a row protected by the request's current lock.
+        cache_manages_duplicate_rows = configure_retire_cache_insert(
+            insert_params,
+            tree_cache_type=tree_cache_type,
+            protected_prefix_len=req.kv.cache_protected_len,
+            rotation_base=req.kv_rotation_base,
+        )
+        insert_result = self.tree_cache.insert(insert_params)
+        if insert_result.rotation_tail_declined:
+            raise RetireKVInheritanceError(
+                "UnifiedRadixCache declined the RETIRE rotation tail"
+            )
         if insert_result.prefix_len < req.kv.cache_protected_len:
             raise RetireKVInheritanceError(
-                "RadixCache insertion regressed the protected prefix"
+                "prefix-cache insertion regressed the protected prefix"
             )
-        match = self.tree_cache.match_prefix(MatchPrefixParams(key=radix_key))
+        match = self.tree_cache.match_prefix(
+            MatchPrefixParams(key=radix_key, req=req if unified_cache else None)
+        )
         canonical_indices = match.device_indices
         if len(canonical_indices) != aligned:
             raise RetireKVInheritanceError(
-                "RadixCache did not return the complete inserted prefix"
+                "prefix cache did not return the complete inserted prefix"
             )
 
         # First lock is the request's replacement prefix lock; the second is
         # the independent RETIRE pin that survives stale-request cleanup.
-        request_lock = self.tree_cache.inc_lock_ref(match.last_device_node)
-        self.tree_cache.inc_lock_ref(match.last_device_node)
+        request_lock, retire_lock = acquire_retire_cache_locks(
+            self.tree_cache, match.last_device_node
+        )
         if req.last_node is not None:
             self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt)
 
         protected = req.kv.cache_protected_len
-        self.token_to_kv_pool_allocator.free_segment(
-            original_indices[protected : insert_result.prefix_len],
-            start_pos=protected,
-        )
+        if not cache_manages_duplicate_rows:
+            self.token_to_kv_pool_allocator.free_segment(
+                original_indices[protected : insert_result.prefix_len],
+                start_pos=protected,
+            )
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(protected, aligned)),
             canonical_indices[protected:],
@@ -5484,7 +5539,7 @@ class Scheduler(
             writer_drained_sequence=self.forward_ct,
         )
         self.retire_kv_inheritance.install(snapshot)
-        self._retire_pinned_nodes[snapshot.key] = match.last_device_node
+        self._retire_pinned_nodes[snapshot.key] = retire_lock
         return snapshot
 
     def _retire_release_snapshots(
@@ -5492,12 +5547,12 @@ class Scheduler(
     ) -> int:
         released = 0
         for snapshot in snapshots:
-            node = self._retire_pinned_nodes.pop(snapshot.key, None)
-            if node is None:
+            lock = self._retire_pinned_nodes.pop(snapshot.key, None)
+            if lock is None:
                 raise RetireKVInheritanceError(
-                    "pinned-prefix registry has no RadixCache lock"
+                    "pinned-prefix registry has no prefix-cache lock"
                 )
-            self.tree_cache.dec_lock_ref(node)
+            release_retire_cache_lock(self.tree_cache, lock)
             released += snapshot.pinned_tokens
         return released
 
@@ -5772,19 +5827,8 @@ class Scheduler(
         self.device_module.synchronize()
         writer_drained_ns = time.monotonic_ns()
 
-        kv_pool_type = type(self.token_to_kv_pool_allocator).__name__
-        tree_cache_type = type(self.tree_cache).__name__
-        complete_single_group = standard_cache_is_certifiable(
-            hybrid_swa=self.is_hybrid_swa,
-            hybrid_ssm=self.is_hybrid_ssm,
-            speculative=not self.spec_algorithm.is_none(),
-            diffusion=self.dllm_config is not None,
-            disaggregated=self.disaggregation_mode != DisaggregationMode.NULL,
-            hierarchical_cache=self.enable_hierarchical_cache,
-            rust_frontend=self.rust_server is not None,
-            kv_pool_type=kv_pool_type,
-            tree_cache_type=tree_cache_type,
-        )
+        cache_topology = self._retire_cache_topology()
+        complete_single_group = cache_topology["cache_topology_certifiable"] is True
 
         pinned_sources: List[RetirePinnedPrefix] = []
         snapshot_errors: List[str] = []
@@ -5867,8 +5911,7 @@ class Scheduler(
             # uncertified until their additional state owners emit receipts.
             "kv_group_ids": ["group-0"] if complete_single_group else [],
             "participant_coordinate_complete": complete_single_group,
-            "kv_pool_type": kv_pool_type,
-            "tree_cache_type": tree_cache_type,
+            **cache_topology,
             "sources": [
                 {
                     "source_request_id": source.source_request_id,

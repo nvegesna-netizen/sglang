@@ -10,11 +10,62 @@ from __future__ import annotations
 import hashlib
 import struct
 from dataclasses import dataclass, replace
-from typing import Iterable
+from typing import Any, Iterable
 
 
 class RetireKVInheritanceError(RuntimeError):
     """Raised when physical KV inheritance cannot be certified."""
+
+
+@dataclass(frozen=True, slots=True)
+class RetireCacheLock:
+    """Prefix-cache lock anchor plus the exact receipt required for release."""
+
+    node: Any
+    release_params: Any
+
+
+def configure_retire_cache_insert(
+    insert_params: Any,
+    *,
+    tree_cache_type: str,
+    protected_prefix_len: int,
+    rotation_base: int | None,
+) -> bool:
+    """Configure cache-specific ownership and return whether insert frees duplicates."""
+
+    if tree_cache_type == "RadixCache":
+        return False
+    if tree_cache_type != "UnifiedRadixCache":
+        raise RetireKVInheritanceError(
+            f"unsupported RETIRE prefix cache type: {tree_cache_type}"
+        )
+    insert_params.prev_prefix_len = protected_prefix_len
+    insert_params.rotation_base = rotation_base
+    return True
+
+
+def acquire_retire_cache_locks(
+    tree_cache: Any, node: Any
+) -> tuple[Any, RetireCacheLock]:
+    """Acquire request and persistent RETIRE locks and preserve both receipts."""
+
+    request_receipt = tree_cache.inc_lock_ref(node)
+    try:
+        retire_receipt = tree_cache.inc_lock_ref(node)
+    except BaseException:
+        tree_cache.dec_lock_ref(node, request_receipt.to_dec_params())
+        raise
+    return request_receipt, RetireCacheLock(
+        node=node,
+        release_params=retire_receipt.to_dec_params(),
+    )
+
+
+def release_retire_cache_lock(tree_cache: Any, lock: RetireCacheLock) -> None:
+    """Release the persistent RETIRE lock with its acquisition receipt."""
+
+    tree_cache.dec_lock_ref(lock.node, lock.release_params)
 
 
 def standard_cache_is_certifiable(
@@ -26,12 +77,20 @@ def standard_cache_is_certifiable(
     disaggregated: bool,
     hierarchical_cache: bool,
     rust_frontend: bool,
+    dcp_enabled: bool,
+    dp_attention: bool,
     kv_pool_type: str,
     tree_cache_type: str,
+    tree_component_types: tuple[str, ...],
+    tree_core_type: str | None,
+    cache_disabled: bool,
+    external_cache_linker: bool,
+    cache_controller_attached: bool,
+    session_radix_cache: bool,
 ) -> bool:
     """Return whether the scheduler has the one-group ownership topology."""
 
-    return not any(
+    common_unsupported = any(
         (
             hybrid_swa,
             hybrid_ssm,
@@ -40,9 +99,23 @@ def standard_cache_is_certifiable(
             disaggregated,
             hierarchical_cache,
             rust_frontend,
+            dcp_enabled,
+            dp_attention,
             kv_pool_type != "PagedTokenToKVPoolAllocator",
-            tree_cache_type != "RadixCache",
+            cache_disabled,
+            external_cache_linker,
+            cache_controller_attached,
+            session_radix_cache,
         )
+    )
+    if common_unsupported:
+        return False
+    if tree_cache_type == "RadixCache":
+        return not tree_component_types and tree_core_type is None
+    return (
+        tree_cache_type == "UnifiedRadixCache"
+        and tree_component_types == ("FULL",)
+        and tree_core_type == "UnifiedTreeCore"
     )
 
 
