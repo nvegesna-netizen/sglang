@@ -482,6 +482,7 @@ class Scheduler(
         self.retire_kv_inheritance = RetireKVInheritanceRegistry()
         self._retire_pinned_nodes: Dict[tuple[str, str, int, str], Any] = {}
         self._retire_launch_receipts: Dict[str, Dict[str, Any]] = {}
+        self._retire_launch_barrier_pending = False
         self.init_soft_watchdog()
 
         # Parse args
@@ -2073,6 +2074,7 @@ class Scheduler(
                 continue
             if not self.output_streamer.retire_poll_deferred_output():
                 continue
+            self._retire_resolve_launch_barrier()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -2118,6 +2120,7 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
+            retire_overlap_result_drained = self._retire_resolve_launch_barrier()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -2135,7 +2138,7 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and not retire_overlap_result_drained:
                 pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
@@ -2158,7 +2161,10 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if (
+                    not disable_overlap_for_batch
+                    and not retire_overlap_result_drained
+                ):
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -5798,6 +5804,63 @@ class Scheduler(
                 "validated_before_forward_sequence": self.forward_ct + 1,
             }
 
+    def _retire_resolve_launch_barrier(self) -> bool:
+        """Reclaim revoked requests before the scheduler can issue another forward.
+
+        In overlap mode, the previous GPU result is complete after ``retire_advance``
+        synchronizes the device but has not yet been committed on the scheduler CPU.
+        Commit that result first so the existing result processor performs zero-token
+        revocation and normal resource cleanup. Requests without a pending result are
+        finished directly, without launching the model solely to reach cleanup code.
+
+        Returns whether the overlap result for ``last_batch`` was consumed. The event
+        loop uses this to avoid consuming the newly launched batch's result in the same
+        iteration while retaining ``last_batch`` for its normal extend/decode merge.
+        """
+        if not self._retire_launch_barrier_pending:
+            return False
+
+        overlap_result_drained = False
+        if self.enable_overlap:
+            if self.last_batch is None:
+                if self.result_queue:
+                    raise RetireAuthorityError(
+                        "RETIRE launch barrier found an overlap result without last_batch"
+                    )
+            else:
+                if len(self.result_queue) != 1:
+                    raise RetireAuthorityError(
+                        "RETIRE launch barrier requires exactly one overlap result "
+                        f"for last_batch, found {len(self.result_queue)}"
+                    )
+                batch, result = self.result_queue.popleft()
+                self.process_batch_result(batch, result)
+                overlap_result_drained = True
+
+        pending_chunked = self._pending_chunked_abort_req
+        for req in self.collect_inflight_reqs():
+            if (
+                req.finished()
+                or self.retire_authority.is_current(req.retire_authority)
+                or req is pending_chunked
+            ):
+                continue
+            reason = req.to_finish
+            if not isinstance(reason, FINISH_ABORT):
+                reason = FINISH_ABORT(
+                    "RETIRE authority revoked before model launch",
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            self.batch_result_processor.abort_before_model_launch(req, reason)
+            self._release_aborted_request(req.rid)
+            self.beam_coordinator.retire_group(req)
+            logger.debug(
+                "Reclaimed stale RETIRE request before model launch. %s", req.rid
+            )
+
+        self._retire_launch_barrier_pending = False
+        return overlap_result_drained
+
     def retire_advance(
         self,
         *,
@@ -5880,6 +5943,7 @@ class Scheduler(
                     abort_message=abort_reason["message"],
                 )
             )
+        self._retire_launch_barrier_pending = True
 
         if snapshot_errors:
             raise RetireKVInheritanceError(

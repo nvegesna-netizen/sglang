@@ -115,6 +115,24 @@ class SchedulerBatchResultProcessor:
     abort_request: Callable
     retire_is_current: Callable[[Any], bool] = lambda _: True
 
+    def abort_before_model_launch(self, req: Req, reason: FINISH_ABORT) -> None:
+        """Finish and reclaim a revoked request without issuing another forward."""
+        if req.finished():
+            return
+        req.finished_reason = reason
+        req.to_finish = None
+        if isinstance(self.draft_worker, BaseSpecWorker):
+            self.draft_worker.note_request_finished(
+                rid=req.rid,
+                natural_stop=False,
+            )
+        self.token_to_kv_pool_allocator.free_group_begin()
+        try:
+            self._handle_sampling_mask_abort(req)
+        finally:
+            self.token_to_kv_pool_allocator.free_group_end()
+        self.output_streamer.stream_output([req], req.return_logprob)
+
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
@@ -347,7 +365,7 @@ class SchedulerBatchResultProcessor:
                     retire_revoked = not self.retire_is_current(
                         req.retire_authority
                     )
-                    if retire_revoked:
+                    if retire_revoked and req.to_finish is None:
                         req.to_finish = FINISH_ABORT(
                             "RETIRE authority revoked before prefill result commit"
                         )
@@ -1010,7 +1028,7 @@ class SchedulerBatchResultProcessor:
                 continue
 
             retire_revoked = not self.retire_is_current(req.retire_authority)
-            if retire_revoked:
+            if retire_revoked and req.to_finish is None:
                 req.to_finish = FINISH_ABORT(
                     "RETIRE authority revoked before decode result commit"
                 )
