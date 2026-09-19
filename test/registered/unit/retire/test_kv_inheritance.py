@@ -359,6 +359,75 @@ class TestRetireKVInheritanceRegistry(unittest.TestCase):
             {"pinned_prefixes": 0, "pending_reservations": 0},
         )
 
+    def test_launch_validation_does_not_consume_until_matching_commit(self):
+        registry = RetireKVInheritanceRegistry()
+        snapshot = prefix()
+        registry.install(snapshot)
+        reservation = registry.reserve(
+            tenant_id="tenant",
+            scope_id="scope",
+            retired_epoch=0,
+            source_request_id="old",
+            successor_request_id="new",
+            new_epoch=1,
+            generation=3,
+            reuse_tokens=4,
+            block_size=4,
+            cache_salt="shared-salt",
+            successor_token_ids=snapshot.token_ids,
+        )
+
+        validated = registry.validate_launch(
+            successor_request_id="new",
+            tenant_id="tenant",
+            scope_id="scope",
+            epoch=1,
+            generation=3,
+            cache_salt="shared-salt",
+            token_ids=snapshot.token_ids,
+            slot_ids=snapshot.slot_ids[:4],
+        )
+
+        self.assertEqual(validated, (snapshot, reservation))
+        self.assertEqual(
+            registry.snapshot(),
+            {"pinned_prefixes": 1, "pending_reservations": 1},
+        )
+        committed = registry.commit_launch("new", expected_reservation=reservation)
+        self.assertEqual(committed, (snapshot, reservation))
+        self.assertEqual(
+            registry.snapshot(),
+            {"pinned_prefixes": 0, "pending_reservations": 0},
+        )
+
+    def test_launch_commit_rejects_changed_reservation_without_consuming(self):
+        registry = RetireKVInheritanceRegistry()
+        snapshot = prefix()
+        registry.install(snapshot)
+        reservation = registry.reserve(
+            tenant_id="tenant",
+            scope_id="scope",
+            retired_epoch=0,
+            source_request_id="old",
+            successor_request_id="new",
+            new_epoch=1,
+            generation=3,
+            reuse_tokens=4,
+            block_size=4,
+            cache_salt="shared-salt",
+            successor_token_ids=snapshot.token_ids,
+        )
+        registry.test_corrupt_reservation_slot("new", slot_offset=0)
+
+        with self.assertRaisesRegex(
+            RetireKVInheritanceError, "changed after launch validation"
+        ):
+            registry.commit_launch("new", expected_reservation=reservation)
+        self.assertEqual(
+            registry.snapshot(),
+            {"pinned_prefixes": 1, "pending_reservations": 1},
+        )
+
     def test_scope_reclaim_keeps_reserved_source_until_cancelled(self):
         registry = RetireKVInheritanceRegistry()
         snapshot = prefix()

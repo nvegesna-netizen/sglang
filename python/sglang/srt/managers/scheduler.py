@@ -481,6 +481,7 @@ class Scheduler(
         self.retire_authority = RetireAuthorityTable()
         self.retire_kv_inheritance = RetireKVInheritanceRegistry()
         self._retire_pinned_nodes: Dict[tuple[str, str, int, str], Any] = {}
+        self._retire_prepared_successors: Set[str] = set()
         self._retire_launch_receipts: Dict[str, Dict[str, Any]] = {}
         self._retire_launch_barrier_pending = False
         self.init_soft_watchdog()
@@ -4151,16 +4152,29 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
 
-        # Update waiting queue
-        can_run_list: List[Req] = adder.can_run_list
-        if len(can_run_list) == 0:
+        # Validate prepared RETIRE successors after prefix matching and selection,
+        # but before suffix allocation and flattened prefill tensors are built.
+        # This lets a failed certificate reject only its request without having to
+        # mutate an already-materialized extend batch.
+        selected_reqs = list(adder.can_run_list)
+        if len(selected_reqs) == 0:
             return None, running_batch
+        can_run_list = self._retire_filter_invalid_resume_requests(selected_reqs)
+        rejected_reqs = set(selected_reqs) - set(can_run_list)
+        adder.can_run_list[:] = can_run_list
+        if adder.new_chunked_req in rejected_reqs:
+            adder.new_chunked_req = None
 
-        can_run_set = set(can_run_list)
-        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        # Every selected request either enters this batch or was terminally
+        # rejected above; neither remains in the waiting queue.
+        selected_set = set(selected_reqs)
+        self.waiting_queue = [x for x in self.waiting_queue if x not in selected_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
+
+        if len(can_run_list) == 0:
+            return None, running_batch
 
         if adder.new_chunked_req is not None:
             # Update chunked prefill
@@ -5663,9 +5677,12 @@ class Scheduler(
         receipts = self.world_group.all_gather_object(local)
         if any(receipt.get("prepared") is not True for receipt in receipts):
             self.retire_kv_inheritance.cancel_reservation(successor_request_id)
+        else:
+            self._retire_prepared_successors.add(successor_request_id)
         return receipts
 
     def retire_request_complete(self, *, request_id: str) -> List[Dict[str, Any]]:
+        self._retire_prepared_successors.discard(request_id)
         snapshot = self.retire_kv_inheritance.cancel_reservation(request_id)
         released = 0
         if snapshot is not None:
@@ -5691,6 +5708,7 @@ class Scheduler(
         successor_request_id: str,
         nonce: str,
     ) -> List[Dict[str, Any]]:
+        self._retire_prepared_successors.discard(successor_request_id)
         snapshot = self.retire_kv_inheritance.cancel_reservation(
             successor_request_id,
             expected_source_scope=(tenant_id, scope_id, retired_epoch),
@@ -5773,7 +5791,7 @@ class Scheduler(
             return
         slot_ids = tuple(int(value) for value in req.prefix_indices.tolist())
         token_ids = tuple(req.full_untruncated_fill_ids)
-        verified = self.retire_kv_inheritance.verify_launch(
+        validated = self.retire_kv_inheritance.validate_launch(
             successor_request_id=req.rid,
             tenant_id=tag.tenant_id,
             scope_id=tag.scope_id,
@@ -5783,8 +5801,13 @@ class Scheduler(
             token_ids=token_ids,
             slot_ids=slot_ids,
         )
-        if verified is not None:
-            snapshot, reservation = verified
+        if validated is not None:
+            _, reservation = validated
+            snapshot, reservation = self.retire_kv_inheritance.commit_launch(
+                req.rid,
+                expected_reservation=reservation,
+            )
+            self._retire_prepared_successors.discard(req.rid)
             self._retire_release_snapshots([snapshot])
             self._retire_launch_receipts[req.rid] = {
                 "source_request_id": snapshot.source_request_id,
@@ -5803,6 +5826,104 @@ class Scheduler(
                 "same_physical_slots": True,
                 "validated_before_forward_sequence": self.forward_ct + 1,
             }
+
+    def _retire_filter_invalid_resume_requests(self, reqs: List[Req]) -> List[Req]:
+        """Collectively reject invalid successor handoffs before prefill alloc."""
+
+        candidates = [
+            req
+            for req in reqs
+            if req.rid in self._retire_prepared_successors
+        ]
+        if not candidates:
+            return reqs
+
+        local: Dict[str, Dict[str, Any]] = {}
+        for req in candidates:
+            try:
+                self.retire_authority.require_current(
+                    req.retire_authority,
+                    "successor prefix admission",
+                )
+                tag = req.retire_authority
+                validated = self.retire_kv_inheritance.validate_launch(
+                    successor_request_id=req.rid,
+                    tenant_id=tag.tenant_id,
+                    scope_id=tag.scope_id,
+                    epoch=tag.epoch,
+                    generation=tag.generation,
+                    cache_salt=req.cache_salt or "",
+                    token_ids=tuple(req.full_untruncated_fill_ids),
+                    slot_ids=tuple(int(value) for value in req.prefix_indices.tolist()),
+                )
+                local[req.rid] = {
+                    "prepared": validated is not None,
+                    "error": None,
+                }
+            except (RetireAuthorityError, RetireKVInheritanceError) as error:
+                local[req.rid] = {
+                    "prepared": True,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+
+        rank_results = self.world_group.all_gather_object(local)
+        candidate_ids = tuple(req.rid for req in candidates)
+        expected_ids = set(candidate_ids)
+        malformed = [
+            rank
+            for rank, result in enumerate(rank_results)
+            if not isinstance(result, dict)
+            or set(result) != expected_ids
+            or any(not isinstance(value, dict) for value in result.values())
+        ]
+
+        rejected: Dict[str, str] = {}
+        if malformed:
+            detail = ", ".join(str(rank) for rank in malformed)
+            for request_id in candidate_ids:
+                rejected[request_id] = (
+                    "RETIRE successor participant validation set disagreed on ranks "
+                    f"{detail}"
+                )
+        else:
+            for request_id in candidate_ids:
+                errors = [
+                    (rank, result[request_id].get("error"))
+                    for rank, result in enumerate(rank_results)
+                    if result[request_id].get("error") is not None
+                ]
+                prepared = {
+                    bool(result[request_id].get("prepared")) for result in rank_results
+                }
+                if errors:
+                    rejected[request_id] = "; ".join(
+                        f"rank {rank}: {error}" for rank, error in errors
+                    )
+                elif len(prepared) != 1:
+                    rejected[request_id] = (
+                        "RETIRE successor participants disagreed on whether a "
+                        "prepared reservation exists"
+                    )
+
+        accepted: List[Req] = []
+        for req in reqs:
+            detail = rejected.get(req.rid)
+            if detail is None:
+                accepted.append(req)
+                continue
+
+            message = f"RETIRE successor launch rejected: {detail}"
+            logger.warning("%s, rid=%s", message, req.rid)
+            req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+            if req.last_node is not None:
+                self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt)
+                req.last_node = None
+            self._release_aborted_request(req.rid)
+            self.beam_coordinator.retire_group(req)
+            prepare_abort(req, message, status_code=HTTPStatus.CONFLICT)
+            self.output_streamer.stream_output([req], req.return_logprob)
+
+        return accepted
 
     def _retire_resolve_launch_barrier(self) -> bool:
         """Reclaim revoked requests before the scheduler can issue another forward.

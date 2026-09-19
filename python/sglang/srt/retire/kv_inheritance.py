@@ -313,7 +313,7 @@ class RetireKVInheritanceRegistry:
         self._reserved_sources[snapshot.key] = successor_request_id
         return reservation
 
-    def verify_launch(
+    def validate_launch(
         self,
         *,
         successor_request_id: str,
@@ -325,6 +325,8 @@ class RetireKVInheritanceRegistry:
         token_ids: tuple[int, ...],
         slot_ids: tuple[int, ...],
     ) -> tuple[RetirePinnedPrefix, RetireResumeReservation] | None:
+        """Validate a prepared handoff without consuming its pinned state."""
+
         reservation = self._reservations.get(successor_request_id)
         if reservation is None:
             return None
@@ -375,10 +377,58 @@ class RetireKVInheritanceRegistry:
                 f"observed_digest={observed_digest}"
             )
 
+        return self._snapshots[reservation.source_key], reservation
+
+    def commit_launch(
+        self,
+        successor_request_id: str,
+        *,
+        expected_reservation: RetireResumeReservation,
+    ) -> tuple[RetirePinnedPrefix, RetireResumeReservation]:
+        """Consume a handoff only if it is still the validated reservation."""
+
+        reservation = self._reservations.get(successor_request_id)
+        if reservation is None:
+            raise RetireKVInheritanceError("successor reservation does not exist")
+        if reservation != expected_reservation:
+            raise RetireKVInheritanceError(
+                "successor reservation changed after launch validation"
+            )
+
         snapshot = self._snapshots.pop(reservation.source_key)
         del self._reserved_sources[reservation.source_key]
         del self._reservations[successor_request_id]
         return snapshot, reservation
+
+    def verify_launch(
+        self,
+        *,
+        successor_request_id: str,
+        tenant_id: str,
+        scope_id: str,
+        epoch: int,
+        generation: int,
+        cache_salt: str,
+        token_ids: tuple[int, ...],
+        slot_ids: tuple[int, ...],
+    ) -> tuple[RetirePinnedPrefix, RetireResumeReservation] | None:
+        validated = self.validate_launch(
+            successor_request_id=successor_request_id,
+            tenant_id=tenant_id,
+            scope_id=scope_id,
+            epoch=epoch,
+            generation=generation,
+            cache_salt=cache_salt,
+            token_ids=token_ids,
+            slot_ids=slot_ids,
+        )
+        if validated is None:
+            return None
+        _, reservation = validated
+        return self.commit_launch(
+            successor_request_id,
+            expected_reservation=reservation,
+        )
 
     def cancel_reservation(
         self,
