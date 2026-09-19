@@ -349,9 +349,30 @@ class RetireKVInheritanceRegistry:
             raise RetireKVInheritanceError(
                 "successor token digest differs from reservation"
             )
-        if tuple(slot_ids[: reservation.reuse_tokens]) != reservation.slot_ids:
+        observed_slots = tuple(slot_ids[: reservation.reuse_tokens])
+        if observed_slots != reservation.slot_ids:
+            first_mismatch = next(
+                (
+                    offset
+                    for offset, (expected, observed) in enumerate(
+                        zip(reservation.slot_ids, observed_slots)
+                    )
+                    if expected != observed
+                ),
+                min(len(reservation.slot_ids), len(observed_slots)),
+            )
+            try:
+                observed_digest = sequence_digest(observed_slots)
+            except RetireKVInheritanceError:
+                observed_digest = "invalid"
             raise RetireKVInheritanceError(
-                "successor physical slots differ from reservation"
+                "successor physical slots differ from reservation: "
+                f"expected_len={len(reservation.slot_ids)}, "
+                f"observed_prefix_len={len(observed_slots)}, "
+                f"observed_total_len={len(slot_ids)}, "
+                f"first_mismatch={first_mismatch}, "
+                f"expected_digest={reservation.slot_digest}, "
+                f"observed_digest={observed_digest}"
             )
 
         snapshot = self._snapshots.pop(reservation.source_key)

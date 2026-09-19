@@ -14,9 +14,6 @@ from typing import Optional
 from unittest import mock
 
 import torch
-from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
-from unified_tree_core_inspector import UnifiedTreeCoreInspector
-
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.kv_events import (
@@ -27,7 +24,10 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    PagedTokenToKVPoolAllocator,
+    TokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -39,7 +39,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str
+from sglang.srt.mem_cache.common import available_and_evictable_str, release_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -90,6 +90,8 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     _OngoingPrefetch,
     _OngoingWriteThrough,
 )
+from sglang.srt.retire.authority import RetireAuthorityTag
+from sglang.srt.retire.kv_inheritance import RetireKVInheritanceRegistry
 from sglang.srt.runtime_context import (
     get_serving,
     mamba_cache_chunk_size,
@@ -103,6 +105,8 @@ from sglang.srt.session.streaming_session import SessionSlot
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
+from unified_tree_core_inspector import UnifiedTreeCoreInspector
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small-amd")
@@ -1692,6 +1696,147 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(allocator.available_size(), avail_before + kv_len)
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
         self.assertEqual(len(m.device_indices), 0)
+        cache.sanity_check()
+
+    def test_retire_pinned_prefix_survives_revoked_request_cleanup(self):
+        """Exercise the real RETIRE cache lifecycle, not synthetic slot tuples."""
+        if self.cfg.page_size != 16 or self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("RETIRE production canary topology is Full-only page_size=16")
+        if self.cfg.sliding_window_size is not None or self.cfg.has_mamba:
+            self.skipTest("RETIRE production canary excludes hybrid cache components")
+
+        from sglang.srt.managers.scheduler import Scheduler
+
+        cache, flat_allocator, req_to_token_pool = build_fixture(self.cfg)
+        allocator = PagedTokenToKVPoolAllocator(
+            size=self.cfg.kv_size,
+            page_size=self.cfg.page_size,
+            dtype=self.cfg.dtype,
+            device=get_device(),
+            kvcache=flat_allocator._kvcache,
+            need_sort=False,
+        )
+        cache.token_to_kv_pool_allocator = allocator
+        prompt = list(range(1, 129))
+        revised = prompt[:]
+        revised[-1] += 10_000
+        cache_salt = "default:sglang-internal-kv:certified_hbm:e0"
+
+        source = self._make_req(req_to_token_pool)
+        source.rid = "source"
+        source.origin_input_ids = array("q", prompt)
+        source.output_ids = array("q", [20_001])
+        source.full_untruncated_fill_ids = array("q", prompt + [20_001])
+        source.cache_salt = cache_salt
+        source.retire_authority = RetireAuthorityTag(
+            tenant_id="default",
+            scope_id="sglang-internal-kv:certified_hbm",
+            epoch=0,
+            generation=0,
+        )
+        source.last_node = cache.root_node_handle()
+        source.lock_receipt = cache.inc_lock_ref(source.last_node).to_dec_params()
+        source.kv.cache_protected_len = 0
+        source.kv.kv_committed_len = len(prompt)
+        source.kv.kv_allocated_len = len(prompt)
+        source.set_extend_range(0, len(prompt))
+        source_slots = self._alloc(allocator, len(prompt))
+        self.assertIsNotNone(source_slots)
+        req_to_token_pool.write(
+            (source.kv.req_pool_idx, slice(0, len(prompt))), source_slots
+        )
+
+        scheduler = SimpleNamespace(
+            page_size=self.cfg.page_size,
+            tree_cache=cache,
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=req_to_token_pool,
+            forward_ct=7,
+            retire_kv_inheritance=RetireKVInheritanceRegistry(),
+            _retire_pinned_nodes={},
+        )
+        snapshot = Scheduler._retire_pin_committed_prefix(
+            scheduler, source, retired_epoch=0, generation=0
+        )
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.pinned_tokens, 128)
+
+        reservation = scheduler.retire_kv_inheritance.reserve(
+            tenant_id="default",
+            scope_id="sglang-internal-kv:certified_hbm",
+            retired_epoch=0,
+            source_request_id="source",
+            successor_request_id="successor",
+            new_epoch=1,
+            generation=1,
+            reuse_tokens=112,
+            block_size=16,
+            cache_salt=cache_salt,
+            successor_token_ids=tuple(revised),
+        )
+
+        # This is the production revoked-request cleanup path after the RETIRE pin.
+        release_kv_cache(source, cache, is_insert=False)
+
+        successor = self._make_req(req_to_token_pool)
+        successor.rid = "successor"
+        successor.origin_input_ids = array("q", revised)
+        successor.cache_salt = cache_salt
+        successor.retire_authority = RetireAuthorityTag(
+            tenant_id="default",
+            scope_id="sglang-internal-kv:certified_hbm",
+            epoch=1,
+            generation=1,
+        )
+        successor.init_next_round_input(cache)
+        successor.lock_receipt = cache.inc_lock_ref(successor.last_node).to_dec_params()
+
+        observed = tuple(int(value) for value in successor.prefix_indices.tolist())
+        expected = reservation.slot_ids
+        first_mismatch = next(
+            (
+                index
+                for index, (left, right) in enumerate(zip(expected, observed))
+                if left != right
+            ),
+            None,
+        )
+        self.assertEqual(
+            len(observed),
+            112,
+            msg={
+                "expected_reuse": 112,
+                "observed_prefix_len": len(observed),
+                "snapshot_slots": snapshot.slot_ids,
+                "observed_slots": observed,
+            },
+        )
+        self.assertEqual(
+            observed,
+            expected,
+            msg={
+                "first_mismatch": first_mismatch,
+                "snapshot_slots": snapshot.slot_ids,
+                "reservation_slots": expected,
+                "observed_slots": observed,
+            },
+        )
+        verified = scheduler.retire_kv_inheritance.verify_launch(
+            successor_request_id=successor.rid,
+            tenant_id="default",
+            scope_id="sglang-internal-kv:certified_hbm",
+            epoch=1,
+            generation=1,
+            cache_salt=cache_salt,
+            token_ids=tuple(successor.full_untruncated_fill_ids),
+            slot_ids=observed,
+        )
+        self.assertIsNotNone(verified)
+        verified_snapshot, _ = verified
+        Scheduler._retire_release_snapshots(scheduler, [verified_snapshot])
+        cache.dec_lock_ref(successor.last_node, successor.lock_receipt)
+        req_to_token_pool.free(successor)
+        successor.kv.mark_kv_released()
         cache.sanity_check()
 
     def test_cache_unfinished_req(self):

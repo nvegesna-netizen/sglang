@@ -317,7 +317,15 @@ class TestRetireKVInheritanceRegistry(unittest.TestCase):
             cache_salt="shared-salt",
             successor_token_ids=(10, 11, 12, 13, 99),
         )
-        with self.assertRaisesRegex(RetireKVInheritanceError, "physical slots"):
+        with self.assertRaisesRegex(
+            RetireKVInheritanceError,
+            (
+                "physical slots differ.*expected_len=4.*observed_prefix_len=4"
+                ".*observed_total_len=4.*first_mismatch=3"
+                f".*expected_digest={sequence_digest((30, 31, 32, 33))}"
+                f".*observed_digest={sequence_digest((30, 31, 32, 99))}"
+            ),
+        ):
             registry.verify_launch(
                 successor_request_id="new",
                 tenant_id="tenant",
