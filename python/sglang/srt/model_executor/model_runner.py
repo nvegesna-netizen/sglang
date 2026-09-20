@@ -187,6 +187,12 @@ from sglang.srt.runtime_context import (
     remote_instance_transfer_engine_enabled,
     set_global_dwdp_manager,
 )
+from sglang.srt.retire.worker_authority import (
+    bind_forward_authority,
+    finish_forward_authority,
+    forward_requires_layer_safe_points,
+    initialize_worker_authority,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_observer import SamplingObserver
 from sglang.srt.server_args import (  # noqa: F401  (re-export)
@@ -431,6 +437,7 @@ class ModelRunner:
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
+        self.retire_worker_authority = initialize_worker_authority(self.device)
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -1633,6 +1640,26 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        retire_state = bind_forward_authority(forward_batch)
+        try:
+            return self._forward_with_bound_authority(
+                forward_batch,
+                skip_attn_backend_init=skip_attn_backend_init,
+                pp_proxy_tensors=pp_proxy_tensors,
+                reinit_attn_backend=reinit_attn_backend,
+                split_forward_count=split_forward_count,
+            )
+        finally:
+            finish_forward_authority(retire_state)
+
+    def _forward_with_bound_authority(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: Optional[bool] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        reinit_attn_backend: bool = False,
+        split_forward_count: int = 1,
+    ) -> ModelRunnerOutput:
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
@@ -1790,6 +1817,7 @@ class ModelRunner:
                 mode_check()
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
+                and not forward_requires_layer_safe_points()
             )
 
             if (
@@ -1826,6 +1854,11 @@ class ModelRunner:
 
             if forward_batch.forward_mode.is_split_prefill():
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
+                if forward_requires_layer_safe_points():
+                    raise RuntimeError(
+                        "RETIRE layer safe points do not support SGLang PD-multiplexed "
+                        "split prefill"
+                    )
                 ret = self.forward_split_prefill(
                     forward_batch,
                     reinit_attn_backend=reinit_attn_backend,
@@ -1836,6 +1869,7 @@ class ModelRunner:
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
+                and not forward_requires_layer_safe_points()
                 and _prefill_cuda_graph_allows_context_parallel(
                     self.prefill_cuda_graph_runner, forward_batch
                 )

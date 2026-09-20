@@ -502,6 +502,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    # Out-of-band RETIRE mailbox coordinates, one per request.  Entries are
+    # absent for ordinary SGLang traffic and for authority tags that use only
+    # host-side publication gates.
+    retire_worker_authorities: Optional[List[Optional[Tuple[int, int]]]] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -855,6 +859,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            retire_worker_authorities=[
+                (
+                    req.retire_authority.worker_authority
+                    if req.retire_authority is not None
+                    else None
+                )
+                for req in batch.reqs
+            ],
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,

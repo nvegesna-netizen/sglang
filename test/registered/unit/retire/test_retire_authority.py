@@ -4,8 +4,10 @@ import ast
 import importlib.util
 import sys
 import threading
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     from sglang.test.ci.ci_register import register_cpu_ci
@@ -56,12 +58,53 @@ class TestRetireAuthority(unittest.TestCase):
         with self.assertRaises(RetireAuthorityError):
             RetireAuthorityTag.from_value({**value, "epoch": True})
 
+    def test_parse_carries_atomic_worker_mailbox_authority(self):
+        value = {
+            **tag(0, 0).to_dict(),
+            "mailbox_slot": 7,
+            "mailbox_version": 11,
+        }
+        parsed = RetireAuthorityTag.from_value(value)
+        self.assertEqual(parsed.worker_authority, (7, 11))
+        self.assertEqual(parsed.to_dict(), value)
+        for missing in ("mailbox_slot", "mailbox_version"):
+            malformed = dict(value)
+            malformed.pop(missing)
+            with self.subTest(missing=missing), self.assertRaises(RetireAuthorityError):
+                RetireAuthorityTag.from_value(malformed)
+
     def test_bind_initializes_epoch_zero_and_is_idempotent(self):
         table = RetireAuthorityTable()
         table.bind("request", tag(0, 0))
         table.bind("request", tag(0, 0))
         self.assertTrue(table.is_current(tag(0, 0)))
         self.assertEqual(table.snapshot()["requests"]["request"], tag(0, 0).to_dict())
+
+    def test_worker_mailbox_revokes_before_host_table_advance(self):
+        worker_tag = RetireAuthorityTag(
+            tenant_id="tenant",
+            scope_id="scope",
+            epoch=0,
+            generation=1,
+            mailbox_slot=3,
+            mailbox_version=5,
+        )
+        table = RetireAuthorityTable()
+        table.bind("request", worker_tag)
+
+        package = types.ModuleType("retire_serving")
+        package.__path__ = []
+        mailbox = types.ModuleType("retire_serving.epoch_mailbox")
+        observed = {"admission_safe": True}
+        mailbox.host_check_version = lambda *_args: dict(observed)
+        modules = {
+            "retire_serving": package,
+            "retire_serving.epoch_mailbox": mailbox,
+        }
+        with patch.dict(sys.modules, modules):
+            self.assertTrue(table.is_current(worker_tag))
+            observed["admission_safe"] = False
+            self.assertFalse(table.is_current(worker_tag))
 
     def test_bind_rejects_future_epoch_without_advance(self):
         table = RetireAuthorityTable()

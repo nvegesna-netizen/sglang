@@ -51,6 +51,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.retire.worker_authority import layer_safe_point_plan
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -413,7 +414,16 @@ class Qwen2Model(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
+        retire_layer_plan = None if self.layers_to_capture else layer_safe_point_plan()
         for i in range(self.start_layer, self.end_layer):
+            local_layer_index = i - self.start_layer
+            if (
+                retire_layer_plan is not None
+                and local_layer_index > 0
+                and local_layer_index % retire_layer_plan[0] == 0
+                and retire_layer_plan[1]()
+            ):
+                break
             if i in self.layers_to_capture:
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states

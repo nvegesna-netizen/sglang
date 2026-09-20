@@ -34,24 +34,48 @@ class RetireAuthorityTag:
     scope_id: str
     epoch: int
     generation: int
+    mailbox_slot: int | None = None
+    mailbox_version: int | None = None
 
     def __post_init__(self) -> None:
         _nonempty_string(self.tenant_id, "tenant_id")
         _nonempty_string(self.scope_id, "scope_id")
         _nonnegative_integer(self.epoch, "epoch")
         _nonnegative_integer(self.generation, "generation")
+        if (self.mailbox_slot is None) != (self.mailbox_version is None):
+            raise RetireAuthorityError(
+                "mailbox_slot and mailbox_version must be provided together"
+            )
+        if self.mailbox_slot is not None:
+            _nonnegative_integer(self.mailbox_slot, "mailbox_slot")
+            _nonnegative_integer(self.mailbox_version, "mailbox_version")
 
     @property
     def scope_key(self) -> tuple[str, str]:
         return self.tenant_id, self.scope_id
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "tenant_id": self.tenant_id,
             "scope_id": self.scope_id,
             "epoch": self.epoch,
             "generation": self.generation,
         }
+        if self.mailbox_slot is not None:
+            value.update(
+                {
+                    "mailbox_slot": self.mailbox_slot,
+                    "mailbox_version": self.mailbox_version,
+                }
+            )
+        return value
+
+    @property
+    def worker_authority(self) -> tuple[int, int] | None:
+        if self.mailbox_slot is None:
+            return None
+        assert self.mailbox_version is not None
+        return self.mailbox_slot, self.mailbox_version
 
     @classmethod
     def from_value(cls, value: Any) -> RetireAuthorityTag | None:
@@ -61,16 +85,34 @@ class RetireAuthorityTag:
             return value
         if not isinstance(value, Mapping):
             raise RetireAuthorityError("retire authority must be an object")
-        expected = {"tenant_id", "scope_id", "epoch", "generation"}
-        if set(value) != expected:
+        base_fields = {"tenant_id", "scope_id", "epoch", "generation"}
+        worker_fields = {"mailbox_slot", "mailbox_version"}
+        fields = frozenset(value)
+        if fields not in {
+            frozenset(base_fields),
+            frozenset(base_fields | worker_fields),
+        }:
             raise RetireAuthorityError(
-                "retire authority fields must be exactly " + ", ".join(sorted(expected))
+                "retire authority fields must be exactly "
+                + ", ".join(sorted(base_fields))
+                + " with either both or neither of "
+                + ", ".join(sorted(worker_fields))
             )
         return cls(
             tenant_id=_nonempty_string(value["tenant_id"], "tenant_id"),
             scope_id=_nonempty_string(value["scope_id"], "scope_id"),
             epoch=_nonnegative_integer(value["epoch"], "epoch"),
             generation=_nonnegative_integer(value["generation"], "generation"),
+            mailbox_slot=(
+                _nonnegative_integer(value["mailbox_slot"], "mailbox_slot")
+                if "mailbox_slot" in value
+                else None
+            ),
+            mailbox_version=(
+                _nonnegative_integer(value["mailbox_version"], "mailbox_version")
+                if "mailbox_version" in value
+                else None
+            ),
         )
 
 
@@ -182,9 +224,23 @@ class RetireAuthorityTable:
             return True
         with self._lock:
             current = self._current.get(tag.scope_key)
-            return current is not None and (
+            semantically_current = current is not None and (
                 current.epoch == tag.epoch and current.generation == tag.generation
             )
+        if not semantically_current:
+            return False
+        worker_authority = tag.worker_authority
+        if worker_authority is None:
+            return True
+        try:
+            from retire_serving.epoch_mailbox import host_check_version
+
+            receipt = host_check_version(*worker_authority)
+        except Exception:
+            # A tagged request must never regain authority merely because its
+            # out-of-band publication channel is missing or unreadable.
+            return False
+        return receipt["admission_safe"] is True
 
     def require_current(self, tag: RetireAuthorityTag | None, phase: str) -> None:
         if not self.is_current(tag):

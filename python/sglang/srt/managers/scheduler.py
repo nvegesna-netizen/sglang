@@ -2162,10 +2162,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if (
-                    not disable_overlap_for_batch
-                    and not retire_overlap_result_drained
-                ):
+                if not disable_overlap_for_batch and not retire_overlap_result_drained:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -5831,9 +5828,7 @@ class Scheduler(
         """Collectively reject invalid successor handoffs before prefill alloc."""
 
         candidates = [
-            req
-            for req in reqs
-            if req.rid in self._retire_prepared_successors
+            req for req in reqs if req.rid in self._retire_prepared_successors
         ]
         if not candidates:
             return reqs
@@ -5991,6 +5986,8 @@ class Scheduler(
         new_epoch: int,
         generation: int,
         nonce: str,
+        mailbox_slot: Optional[int] = None,
+        mailbox_version: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Advance authority and return rank-level writer-drain evidence.
 
@@ -6000,6 +5997,36 @@ class Scheduler(
         """
         if not nonce:
             raise RetireAuthorityError("nonce must be a non-empty string")
+        mailbox_configured = bool(os.environ.get("RETIRE_EPOCH_MAILBOX_PATH"))
+        if (mailbox_slot is None) != (mailbox_version is None):
+            raise RetireAuthorityError(
+                "mailbox_slot and mailbox_version must be provided together"
+            )
+        if mailbox_configured != (mailbox_slot is not None):
+            raise RetireAuthorityError(
+                "RETIRE mailbox configuration and ADVANCE envelope disagree"
+            )
+
+        mailbox_observed_ns: Optional[int] = None
+        mailbox_observed_version: Optional[int] = None
+        if mailbox_slot is not None:
+            from retire_serving.epoch_mailbox import (
+                host_check_version,
+                pack_version,
+            )
+
+            expected_version = pack_version(new_epoch, generation)
+            if mailbox_version != expected_version:
+                raise RetireAuthorityError(
+                    "ADVANCE mailbox version does not encode new epoch/generation"
+                )
+            publication = host_check_version(mailbox_slot, mailbox_version)
+            mailbox_observed_ns = time.monotonic_ns()
+            mailbox_observed_version = int(publication["observed_version"])
+            if publication["admission_safe"] is not True:
+                raise RetireAuthorityError(
+                    "out-of-band ADVANCE was not visible before scheduler RPC"
+                )
         advance_started_ns = time.monotonic_ns()
         advance = self.retire_authority.advance(
             tenant_id=tenant_id,
@@ -6079,6 +6106,11 @@ class Scheduler(
             "retired_epoch": retired_epoch,
             "new_epoch": new_epoch,
             "generation": generation,
+            "mailbox_slot": mailbox_slot,
+            "mailbox_version": mailbox_version,
+            "mailbox_observed_version": mailbox_observed_version,
+            "mailbox_observed_ns": mailbox_observed_ns,
+            "mailbox_publication_observed": mailbox_slot is not None,
             "request_ids": list(advance.retired_request_ids),
             "world_rank": self.world_group.rank,
             "pipeline_parallel_rank": self.ps.pp_rank,
@@ -6108,6 +6140,20 @@ class Scheduler(
                 }
                 for source in pinned_sources
             ],
+        }
+        return self.world_group.all_gather_object(local_receipt)
+
+    def retire_epoch_audit(self) -> List[Dict[str, Any]]:
+        """Collect rank-local mailbox relay and safe-point counters."""
+
+        from sglang.srt.retire.worker_authority import worker_authority_audit
+
+        local_receipt = {
+            "world_rank": self.world_group.rank,
+            "pipeline_parallel_rank": self.ps.pp_rank,
+            "tensor_parallel_rank": self.ps.tp_rank,
+            "safe_point_sequence": self.forward_ct,
+            **worker_authority_audit(),
         }
         return self.world_group.all_gather_object(local_receipt)
 
